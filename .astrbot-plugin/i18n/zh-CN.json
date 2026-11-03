@@ -1,0 +1,8 @@
+{
+  "views": {
+    "cache-diagnostics": {
+      "title": "缓存诊断面板",
+      "description": "查看缓存 token usage、请求指纹变化与插件提示词改动。"
+    }
+  }
+}

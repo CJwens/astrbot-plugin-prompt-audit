@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>缓存诊断</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">ASTRBOT · PROMPT AUDIT</div>
+          <h1>缓存与提示词诊断</h1>
+          <p class="subtitle">
+            查看服务商回报的缓存 token，并追踪请求指纹和插件改动。
+          </p>
+        </div>
+        <div class="actions">
+          <label class="range-control">
+            <span>统计范围</span>
+            <select id="range">
+              <option value="24">最近 24 小时</option>
+              <option value="168">最近 7 天</option>
+              <option value="720">最近 30 天</option>
+            </select>
+          </label>
+          <button id="refresh" class="refresh-button" type="button">
+            <span aria-hidden="true">↻</span> 刷新
+          </button>
+          <button id="export" class="refresh-button" type="button">
+            导出 CSV
+          </button>
+        </div>
+      </header>
+
+      <div id="notice" class="notice" role="status">
+        正在读取诊断数据…
+      </div>
+
+      <section class="cards" aria-label="缓存统计">
+        <article class="metric-card accent">
+          <div class="metric-label">分模型报告缓存比例</div>
+          <div class="metric-value">见下方</div>
+          <div class="metric-note">不合并不同模型的比例</div>
+        </article>
+        <article class="metric-card">
+          <div class="metric-label">报告有缓存 token 的调用</div>
+          <div id="cached-records" class="metric-value">—</div>
+          <div class="metric-note">Provider 返回缓存输入大于 0</div>
+        </article>
+        <article class="metric-card">
+          <div class="metric-label">报告缓存为 0 的调用</div>
+          <div id="zero-cached-records" class="metric-value">—</div>
+          <div class="metric-note">不是缓存失效证明，只是排查信号</div>
+        </article>
+        <article class="metric-card">
+          <div class="metric-label">同次有请求改动</div>
+          <div id="hook-changed-usage-records" class="metric-value">—</div>
+          <div class="metric-note">已关联 usage 中观察到字段变化</div>
+        </article>
+        <article class="metric-card">
+          <div class="metric-label">已记录 Provider 调用</div>
+          <div id="usage-records" class="metric-value">—</div>
+          <div class="metric-note">包含无输入量或缓存量为零的响应</div>
+        </article>
+        <article class="metric-card">
+          <div class="metric-label">未取得 usage</div>
+          <div id="missing-usage" class="metric-value">—</div>
+          <div id="missing-final-note" class="metric-note">另列最终流响应缺失数</div>
+        </article>
+        <article class="metric-card">
+          <div class="metric-label">请求钩子改动</div>
+          <div id="mutations" class="metric-value">—</div>
+          <div class="metric-note">观察到的请求钩子改动</div>
+        </article>
+        <article class="metric-card">
+          <div class="metric-label">usage 关联状态</div>
+          <div id="association-status" class="metric-value">—</div>
+          <div id="association-note" class="metric-note">等待诊断数据</div>
+        </article>
+      </section>
+
+      <section class="panel model-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>按服务商 / 模型统计</h2>
+            <p>不同模型分别统计；不要把各模型比例直接当作同一口径比较。</p>
+          </div>
+          <div class="signal-legend">
+            <span class="signal-good">● 有缓存 token</span>
+            <span class="signal-warn">● 报告为 0，仅作排查线索</span>
+            <span>● 未关联不能归因</span>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>服务商</th>
+                <th>模型</th>
+                <th>报告缓存输入</th>
+                <th>报告未缓存输入</th>
+                <th>报告缓存比例</th>
+                <th>调用数</th>
+                <th>有缓存调用</th>
+                <th>报告 0 调用</th>
+                <th>同次有改动</th>
+                <th>未关联</th>
+              </tr>
+            </thead>
+            <tbody id="models">
+              <tr><td colspan="10" class="empty">暂无可统计的输入 usage</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div>
+            <h2>群聊与私聊用量</h2>
+            <p>每 30 秒刷新已归属的用量。名称仅用于展示，原始群号和用户号仍不保存。</p>
+          </div>
+        </div>
+        <div class="scope-tabs" role="tablist" aria-label="用量类型">
+          <button
+            id="scope-tab-groups"
+            class="scope-tab active"
+            type="button"
+            role="tab"
+            aria-selected="true"
+          >
+            群聊
+          </button>
+          <button
+            id="scope-tab-private"
+            class="scope-tab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+          >
+            私聊
+          </button>
+        </div>
+        <div id="groups-view" class="scope-layout">
+          <aside class="scope-sidebar">
+            <div class="scope-sidebar-heading">
+              <strong>最近活跃群</strong>
+              <span id="group-count">0 个群</span>
+            </div>
+            <div id="group-list" class="scope-list"></div>
+          </aside>
+          <div class="scope-content">
+            <div class="scope-content-heading">
+              <strong id="selected-group">群汇总；选择左侧群查看成员明细</strong>
+              <span>
+                按输入 token 从高到低排列
+                <button id="group-detail-button" class="inline-button" type="button" hidden>查看群详情</button>
+              </span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>层级</th>
+                    <th>群名 / 群哈希</th>
+                    <th>成员名 / 成员哈希</th>
+                    <th>服务商 / 模型</th>
+                    <th>缓存输入</th>
+                    <th>未缓存输入</th>
+                    <th>输出</th>
+                    <th>调用</th>
+                    <th>报告缓存率</th>
+                  </tr>
+                </thead>
+                <tbody id="scope-usage">
+                  <tr><td colspan="9" class="empty">选择左侧群，查看成员用量</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="timeline-footer">
+              <div id="scope-limit-note" class="limit-note"></div>
+              <nav class="pagination" aria-label="群成员用量分页">
+                <button id="scope-previous-page" type="button">上一页</button>
+                <span id="scope-page-label">第 1 页</span>
+                <button id="scope-next-page" type="button">下一页</button>
+              </nav>
+            </div>
+          </div>
+        </div>
+        <div id="private-view" class="scope-private" hidden>
+          <div class="scope-sidebar-heading">
+            <strong>私聊用户用量</strong>
+            <span id="private-count">0 个用户</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>用户名称 / 用户哈希</th>
+                  <th>服务商 / 模型</th>
+                  <th>缓存输入</th>
+                  <th>未缓存输入</th>
+                  <th>输出</th>
+                  <th>调用</th>
+                  <th>报告缓存率</th>
+                </tr>
+              </thead>
+              <tbody id="private-list">
+                <tr><td colspan="7" class="empty">还没有可归属的私聊 usage</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="timeline-footer">
+            <div id="private-limit-note" class="limit-note"></div>
+            <nav class="pagination" aria-label="私聊用户用量分页">
+              <button id="private-previous-page" type="button">上一页</button>
+              <span id="private-page-label">第 1 页</span>
+              <button id="private-next-page" type="button">下一页</button>
+            </nav>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div>
+            <h2>诊断时间线</h2>
+            <p>默认显示关键结论；展开单条记录可查看关联、指纹、模型、token 和插件改动链。</p>
+          </div>
+          <span id="updated" class="updated"></span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>类型 / 结果</th>
+                <th>详情</th>
+                <th>会话 / 路由</th>
+              </tr>
+            </thead>
+            <tbody id="events">
+              <tr><td colspan="4" class="empty">暂无记录</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="timeline-footer">
+          <div id="limit-note" class="limit-note"></div>
+          <nav class="pagination" aria-label="诊断时间线分页">
+            <button id="previous-page" type="button">上一页</button>
+            <span id="page-label">第 1 页</span>
+            <button id="next-page" type="button">下一页</button>
+          </nav>
+        </div>
+      </section>
+
+      <div id="group-modal" class="modal" hidden>
+        <div class="modal-backdrop" data-close-modal></div>
+        <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="group-modal-title">
+          <header class="modal-heading">
+            <div>
+              <div class="eyebrow">GROUP DETAIL</div>
+              <h2 id="group-modal-title">群详情</h2>
+              <p id="group-modal-subtitle" class="modal-subtitle"></p>
+            </div>
+            <button id="close-group-modal" class="modal-close" type="button" aria-label="关闭">×</button>
+          </header>
+          <div id="group-modal-body" class="modal-body"></div>
+        </section>
+      </div>
+
+      <footer>
+        所有数字仅表示 Provider 响应返回的 usage，不证明缓存实际生效或中转商如何计费；工具循环中的每次调用分别记录。名称可能随平台变化，以最近一次观察到的名称为准。
+      </footer>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

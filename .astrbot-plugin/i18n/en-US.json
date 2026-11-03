@@ -1,0 +1,8 @@
+{
+  "views": {
+    "cache-diagnostics": {
+      "title": "Cache Diagnostics",
+      "description": "Inspect cached-token usage, request fingerprints, and prompt mutations."
+    }
+  }
+}
