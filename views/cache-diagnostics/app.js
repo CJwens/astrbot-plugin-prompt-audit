@@ -45,7 +45,17 @@ function exportTimestamp() {
 }
 
 function csvCell(value) {
-  const text = Array.isArray(value) ? value.join(";") : String(value ?? "");
+  const hasNestedValues =
+    value &&
+    typeof value === "object" &&
+    (Array.isArray(value)
+      ? value.some((item) => item && typeof item === "object")
+      : true);
+  const text = hasNestedValues
+    ? JSON.stringify(value)
+    : Array.isArray(value)
+      ? value.join(";")
+      : String(value ?? "");
   return `"${text.replaceAll('"', '""')}"`;
 }
 
@@ -84,6 +94,46 @@ function detailItem(label, value) {
   return item;
 }
 
+function mutationDeltaSummary(delta = {}) {
+  const labels = {
+    text_initialized: "初始化文本",
+    text_appended: "末尾追加",
+    text_prepended: "开头插入",
+    text_wrapped: "首尾包裹",
+    text_trimmed: "删减文本",
+    text_suffix_removed: "删除末尾",
+    text_prefix_removed: "删除开头",
+    text_extension_position_ambiguous: "扩展位置不确定",
+    text_rewritten: "重写文本",
+    items_initialized: "初始化列表",
+    items_cleared: "清空列表",
+    items_appended: "列表末尾新增",
+    items_prepended: "列表开头插入",
+    items_inserted_around_existing: "列表中间插入",
+    items_removed: "移除列表项",
+    items_reordered: "列表重排",
+    items_rewritten: "重写列表",
+    value_changed: "值变化",
+  };
+  return Object.entries(delta).map(([field, item]) => {
+    const shape = labels[item.kind] || item.kind || "内容变化";
+    const counts = [];
+    if (item.added_prefix_chars) counts.push(`前置 +${item.added_prefix_chars} 字符`);
+    if (item.added_suffix_chars) counts.push(`后置 +${item.added_suffix_chars} 字符`);
+    if (item.removed_prefix_chars) counts.push(`前置 -${item.removed_prefix_chars} 字符`);
+    if (item.removed_suffix_chars) counts.push(`后置 -${item.removed_suffix_chars} 字符`);
+    if (item.added_items) counts.push(`新增 ${item.added_items} 项`);
+    if (item.removed_items) counts.push(`移除 ${item.removed_items} 项`);
+    if (item.before_chars != null && item.after_chars != null) {
+      counts.push(`${item.before_chars}→${item.after_chars} 字符`);
+    }
+    if (item.before_items != null && item.after_items != null) {
+      counts.push(`${item.before_items}→${item.after_items} 项`);
+    }
+    return `${field}: ${shape}${counts.length ? `（${counts.join("，")}）` : ""}`;
+  }).join("；");
+}
+
 function eventDetails(event) {
   const data = event.details || {};
   const wrapper = document.createElement("div");
@@ -111,6 +161,10 @@ function eventDetails(event) {
     ["改动插件", data.request_hook_plugins || data.mutation_plugins],
     ["改动处理器", data.request_hook_handlers || data.mutation_handlers],
     ["改动数量", data.request_mutation_count],
+    ["处理器执行数", data.request_handler_trace_count ?? (data.request_handler_trace || data.handler_trace || []).length],
+    ["已注册钩子数", data.request_handler_inventory_count ?? (data.request_handler_inventory || data.handler_inventory || []).length],
+    ["注册清单截断", data.request_handler_inventory_truncated],
+    ["执行链截断", data.request_handler_trace_truncated],
     ["请求快照指纹", data.request_snapshot_fingerprint],
     ["群", displayIdentity(data.group_name, data.group_hash)],
     ["群名来源", data.group_name_source],
@@ -139,15 +193,110 @@ function eventDetails(event) {
     }
     wrapper.append(snapshots);
   }
-  const chain = data.mutation_chain || [];
+  const chain =
+    data.request_handler_trace ||
+    data.handler_trace ||
+    data.mutation_chain ||
+    [];
   if (chain.length) {
     const title = document.createElement("h4");
-    title.textContent = "同次请求改动链";
+    title.textContent = "请求处理器执行链（含未改动项）";
     const list = document.createElement("ul");
     list.className = "mutation-chain";
-    for (const mutation of chain) {
+    for (const run of chain) {
       const item = document.createElement("li");
-      item.textContent = `${mutation.plugin || "未知插件"} · ${mutation.handler || "未知处理器"} · ${(mutation.changed || []).join(", ") || "字段变化"}`;
+      const changes = mutationDeltaSummary(run.delta || {});
+      const status = run.outcome === "raised"
+        ? `处理异常${run.error_type ? ` (${run.error_type})` : ""}`
+        : run.outcome === "stopped_propagation"
+          ? `停止后续钩子${changes ? `；${changes}` : ""}`
+          : run.outcome === "observation_unavailable"
+            ? "已执行，但请求字段变化观察不可用"
+        : (run.changed || []).length
+          ? changes || (run.changed || []).join(", ")
+          : "已执行，未改动被观察的请求字段";
+      item.textContent = `#${run.sequence || "?"} ${run.plugin || "未知插件"} · ${run.handler || "未知处理器"} · ${status}`;
+      list.append(item);
+    }
+    wrapper.append(title, list);
+  }
+  const inventory =
+    data.request_handler_inventory ||
+    data.handler_inventory ||
+    [];
+  if (inventory.length) {
+    const title = document.createElement("h4");
+    title.textContent = "已注册的 LLM 请求钩子（含停用项）";
+    const list = document.createElement("ul");
+    list.className = "mutation-chain hook-inventory";
+    const runsByHandler = new Map(
+      chain.map((run) => [run.handler_full_name, run])
+    );
+    const propagationStopped = chain.some(
+      (run) => run.outcome === "stopped_propagation"
+    );
+    for (const hook of inventory) {
+      const run = runsByHandler.get(hook.handler_full_name);
+      let status;
+      if (run) {
+        const changes = mutationDeltaSummary(run.delta || {});
+        status = `本次已执行 #${run.sequence}${
+          run.outcome === "stopped_propagation" ? "，并停止后续钩子" : ""
+        }${run.outcome === "raised" ? `，异常 ${run.error_type || "未知"}` : ""}${
+          (run.changed || []).length ? `；${changes}` : "；未改动被观察字段"
+        }`;
+      } else if (hook.status === "plugin_inactive") {
+        status = "插件当前停用";
+      } else if (hook.status === "handler_disabled") {
+        status = "处理器已禁用";
+      } else if (hook.status === "plugin_unavailable") {
+        status = "插件实例不可用";
+      } else if (hook.status === "plugin_filtered") {
+        status = "不在本次事件插件范围";
+      } else if (propagationStopped) {
+        status = "符合调用条件，但前序钩子停止传播，未观察到执行";
+      } else {
+        status = "符合调用条件，但本次未观察到执行";
+      }
+      const item = document.createElement("li");
+      item.textContent = `${hook.plugin || "未知插件"} · ${
+        hook.handler || "未知处理器"
+      } · 优先级 ${hook.priority ?? 0} · ${status}`;
+      list.append(item);
+    }
+    if (data.request_handler_inventory_truncated || data.handler_inventory_truncated) {
+      const item = document.createElement("li");
+      item.textContent = "注册清单已达显示上限，详情中有截断；CSV 标记了完整数量。";
+      list.append(item);
+    }
+    if (data.request_handler_trace_truncated || data.handler_trace_truncated) {
+      const item = document.createElement("li");
+      item.textContent = "执行链已达显示上限，未展示部分不会被判断为未执行。";
+      list.append(item);
+    }
+    wrapper.append(title, list);
+  }
+  if (
+    data.provider_request_snapshot &&
+    Object.keys(data.provider_request_snapshot).length
+  ) {
+    const title = document.createElement("h4");
+    title.textContent = "进入 Provider 的请求参数指纹（不含原文）";
+    const snapshot = document.createElement("div");
+    snapshot.className = "detail-grid";
+    for (const [key, value] of Object.entries(data.provider_request_snapshot)) {
+      snapshot.append(detailItem(key, value));
+    }
+    wrapper.append(title, snapshot);
+  }
+  if (data.delta && event.kind === "mutation") {
+    const title = document.createElement("h4");
+    title.textContent = "字段变化形态（不含原文）";
+    const list = document.createElement("ul");
+    list.className = "mutation-chain";
+    for (const [field, detail] of Object.entries(data.delta)) {
+      const item = document.createElement("li");
+      item.textContent = `${mutationDeltaSummary({ [field]: detail })} · 指纹 ${detail.before_hash || "—"} → ${detail.after_hash || "—"}`;
       list.append(item);
     }
     wrapper.append(title, list);
@@ -191,6 +340,9 @@ function eventPresentation(event) {
             data.request_hook_plugins || []
           ).join(", ") || "请求钩子"}`
         : "未关联请求钩子";
+    const inventoryNote = data.request_handler_inventory_count
+      ? `本请求注册钩子 ${data.request_handler_inventory_count} 个`
+      : "";
     const cacheNote =
       data.input_total > 0 && data.input_cached === 0
         ? "报告缓存为 0，仅作排查线索"
@@ -198,7 +350,7 @@ function eventPresentation(event) {
     return {
       label,
       tone,
-      detail: [provider, tokens, cacheNote, requestChangeNote, associationNote]
+      detail: [provider, tokens, cacheNote, requestChangeNote, associationNote, inventoryNote]
         .filter(Boolean)
         .join(" · "),
     };
@@ -213,14 +365,15 @@ function eventPresentation(event) {
   }
   const changed = (data.hook_changed || []).join(", ");
   const previous = (data.previous_turn_changed || []).join(", ");
+  const inventoryCount = data.handler_inventory_count || 0;
   return {
     label: "请求指纹",
     tone: "neutral",
     detail: changed
-      ? `本轮钩子变化：${changed}`
+      ? `本轮钩子变化：${changed}${inventoryCount ? ` · 注册钩子 ${inventoryCount} 个` : ""}`
       : previous
-        ? `与上一轮不同：${previous}`
-        : "本轮未观察到字段变化",
+        ? `与上一轮不同：${previous}${inventoryCount ? ` · 注册钩子 ${inventoryCount} 个` : ""}`
+        : `本轮未观察到字段变化${inventoryCount ? ` · 注册钩子 ${inventoryCount} 个` : ""}`,
   };
 }
 

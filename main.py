@@ -4,6 +4,7 @@ import json
 import sqlite3
 from contextvars import ContextVar
 from collections import OrderedDict
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
@@ -18,11 +19,18 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .request_association import RequestAssociationRegistry
 from .request_export import request_export_fields
+from .request_mutation import (
+    capture_request_material,
+    capture_provider_request_snapshot,
+    describe_handler_inventory,
+    describe_request_mutation,
+)
 from .routing_identity import build_routing_metadata
 
 PLUGIN_NAME = "astrbot_plugin_prompt_audit"
 MAX_SESSIONS = 512
 MAX_EVENTS = 10000
+MAX_HANDLER_DETAILS = 500
 RETENTION_DAYS = 30
 ASSOCIATION_TTL_SECONDS = 180.0
 NAME_LOOKUP_TTL_SECONDS = 300.0
@@ -36,6 +44,8 @@ def _stable_json(value: Any) -> str:
         model_dump = getattr(item, "model_dump", None)
         if callable(model_dump):
             return normalize(model_dump(mode="json"))
+        if is_dataclass(item):
+            return normalize(asdict(item))
         if isinstance(item, dict):
             return {str(key): normalize(val) for key, val in item.items()}
         if isinstance(item, (list, tuple)):
@@ -70,6 +80,11 @@ def _request_snapshot(req: ProviderRequest) -> dict[str, Any]:
         for tool in tools
     ]
     extra_parts = req.extra_user_content_parts or []
+    tool_results = req.tool_calls_result
+    if tool_results is None:
+        tool_results = []
+    elif not isinstance(tool_results, list):
+        tool_results = [tool_results]
     return {
         "model": req.model or "provider-default",
         "system": f"{_fingerprint(system_prompt)}:{len(system_prompt)}",
@@ -79,7 +94,31 @@ def _request_snapshot(req: ProviderRequest) -> dict[str, Any]:
         "extra": f"{_fingerprint(extra_parts)}:{len(extra_parts)}",
         "images": f"{_fingerprint(req.image_urls or [])}:{len(req.image_urls or [])}",
         "audios": f"{_fingerprint(req.audio_urls or [])}:{len(req.audio_urls or [])}",
+        "tool_results": f"{_fingerprint(tool_results)}:{len(tool_results)}",
     }
+
+
+def _provider_call_diagnostics_arguments(
+    provider: Provider,
+    bound_arguments: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    arguments = dict(bound_arguments)
+    nested_kwargs = arguments.pop("kwargs", {})
+    if isinstance(nested_kwargs, dict):
+        for key, value in nested_kwargs.items():
+            arguments.setdefault(key, value)
+
+    headers = dict(getattr(provider, "request_headers", {}) or {})
+    extra_headers = arguments.get("extra_headers")
+    if isinstance(extra_headers, dict):
+        headers.update(extra_headers)
+    conversation_id = arguments.get("conversation_id")
+    if conversation_id:
+        headers.setdefault(
+            "x-astrbot-conversation-id",
+            conversation_id,
+        )
+    return arguments, headers
 
 
 def _changed_fields(
@@ -92,7 +131,7 @@ def _changed_fields(
     PLUGIN_NAME,
     "CJwen",
     "Inspect provider-reported cache usage and LLM request fingerprint changes.",
-    "0.14.1",
+    "0.15.0",
 )
 class PromptAuditPlugin(star.Star):
     def __init__(self, context: star.Context) -> None:
@@ -254,7 +293,31 @@ class PromptAuditPlugin(star.Star):
                     if item.get("handler")
                 }
             ),
-            "request_mutation_count": len(mutations),
+            "request_mutation_count": request_context.get(
+                "mutation_count", len(mutations)
+            ),
+            "request_mutations_truncated": request_context.get(
+                "mutations_truncated", False
+            ),
+            "request_mutation_chain": list(mutations),
+            "request_handler_trace": list(
+                request_context.get("handler_trace", [])
+            ),
+            "request_handler_trace_count": request_context.get(
+                "handler_trace_count", 0
+            ),
+            "request_handler_trace_truncated": request_context.get(
+                "handler_trace_truncated", False
+            ),
+            "request_handler_inventory": list(
+                request_context.get("handler_inventory", [])
+            ),
+            "request_handler_inventory_count": request_context.get(
+                "handler_inventory_count", 0
+            ),
+            "request_handler_inventory_truncated": request_context.get(
+                "handler_inventory_truncated", False
+            ),
             "request_snapshot_fingerprint": _fingerprint(
                 request_context.get("after", {})
             ),
@@ -349,14 +412,43 @@ class PromptAuditPlugin(star.Star):
                     ).arguments
                 except (TypeError, ValueError):
                     call_arguments = kwargs
+                diagnostic_arguments = dict(call_arguments)
+                header_values: dict[str, Any] = {}
                 try:
-                    model = call_arguments.get("model") or _provider.get_model()
+                    diagnostic_arguments, header_values = (
+                        _provider_call_diagnostics_arguments(
+                            _provider, call_arguments
+                        )
+                    )
+                    provider_request_snapshot = (
+                        capture_provider_request_snapshot(
+                            diagnostic_arguments,
+                            _fingerprint,
+                            header_values,
+                        )
+                    )
+                except Exception as observer_error:
+                    provider_request_snapshot = {}
+                    logger.warning(
+                        "Unable to fingerprint Provider request "
+                        "provider_id=%s error_type=%s",
+                        _provider.provider_config.get("id", "unknown"),
+                        type(observer_error).__name__,
+                    )
+                try:
+                    model = (
+                        diagnostic_arguments.get("model")
+                        or _provider.get_model()
+                    )
                 except Exception:
                     model = "unknown"
                 request_metadata = {
                     "model": model,
-                    "session_id": call_arguments.get("session_id"),
-                    "conversation_id": call_arguments.get("conversation_id"),
+                    "session_id": diagnostic_arguments.get("session_id"),
+                    "conversation_id": diagnostic_arguments.get(
+                        "conversation_id"
+                    ),
+                    "provider_request_snapshot": provider_request_snapshot,
                 }
                 request_metadata["association"] = (
                     self._resolve_request_association(
@@ -399,14 +491,43 @@ class PromptAuditPlugin(star.Star):
                     ).arguments
                 except (TypeError, ValueError):
                     call_arguments = kwargs
+                diagnostic_arguments = dict(call_arguments)
+                header_values: dict[str, Any] = {}
                 try:
-                    model = call_arguments.get("model") or _provider.get_model()
+                    diagnostic_arguments, header_values = (
+                        _provider_call_diagnostics_arguments(
+                            _provider, call_arguments
+                        )
+                    )
+                    provider_request_snapshot = (
+                        capture_provider_request_snapshot(
+                            diagnostic_arguments,
+                            _fingerprint,
+                            header_values,
+                        )
+                    )
+                except Exception as observer_error:
+                    provider_request_snapshot = {}
+                    logger.warning(
+                        "Unable to fingerprint Provider request "
+                        "provider_id=%s error_type=%s",
+                        _provider.provider_config.get("id", "unknown"),
+                        type(observer_error).__name__,
+                    )
+                try:
+                    model = (
+                        diagnostic_arguments.get("model")
+                        or _provider.get_model()
+                    )
                 except Exception:
                     model = "unknown"
                 request_metadata = {
                     "model": model,
-                    "session_id": call_arguments.get("session_id"),
-                    "conversation_id": call_arguments.get("conversation_id"),
+                    "session_id": diagnostic_arguments.get("session_id"),
+                    "conversation_id": diagnostic_arguments.get(
+                        "conversation_id"
+                    ),
+                    "provider_request_snapshot": provider_request_snapshot,
                 }
                 request_metadata["association"] = (
                     self._resolve_request_association(
@@ -498,6 +619,9 @@ class PromptAuditPlugin(star.Star):
             "response_id": response_id,
             "response_chunk": bool(getattr(response, "is_chunk", False)),
             "association_status": "unassociated",
+            "provider_request_snapshot": request_metadata.get(
+                "provider_request_snapshot", {}
+            ),
         }
         association = request_metadata.get("association")
         if isinstance(association, dict):
@@ -1199,6 +1323,15 @@ class PromptAuditPlugin(star.Star):
             "request_hook_plugins",
             "request_hook_handlers",
             "request_mutation_count",
+            "request_mutations_truncated",
+            "request_mutation_chain",
+            "request_handler_trace",
+            "request_handler_trace_count",
+            "request_handler_trace_truncated",
+            "request_handler_inventory",
+            "request_handler_inventory_count",
+            "request_handler_inventory_truncated",
+            "provider_request_snapshot",
             "request_snapshot_fingerprint",
             "scope_type",
             "scope_hash",
@@ -1275,22 +1408,39 @@ class PromptAuditPlugin(star.Star):
 
     @filter.on_astrbot_loaded()
     async def wrap_request_handlers(self) -> None:
+        self._wrap_registered_request_handlers()
+
+    def _wrap_registered_request_handlers(self) -> None:
         from astrbot.core.star.star_handler import (
             EventType,
             star_handlers_registry,
         )
         from astrbot.core.star.star import star_map
 
-        for handler in star_handlers_registry.get_handlers_by_event_type(
-            EventType.OnLLMRequestEvent
-        ):
+        handlers = [
+            handler
+            for handler in star_handlers_registry
+            if handler.event_type == EventType.OnLLMRequestEvent
+        ]
+        current_ids = {id(handler) for handler in handlers}
+        tracked: dict[int, tuple[Any, Any, Any]] = {}
+        for handler, original, wrapper in self._wrapped_handlers:
+            if id(handler) not in current_ids:
+                if handler.handler is wrapper:
+                    handler.handler = original
+                continue
+            if handler.handler is wrapper:
+                tracked[id(handler)] = (handler, original, wrapper)
+        self._wrapped_handlers = list(tracked.values())
+
+        for handler in handlers:
             if handler.handler_module_path.startswith(
                 f"data.plugins.{PLUGIN_NAME}."
             ):
                 continue
-            original = handler.handler
-            if getattr(original, "_prompt_audit_wrapper", False):
+            if id(handler) in tracked:
                 continue
+            original = handler.handler
             plugin = star_map.get(handler.handler_module_path)
             plugin_name = plugin.name if plugin else handler.handler_module_path
 
@@ -1303,84 +1453,177 @@ class PromptAuditPlugin(star.Star):
                 _plugin_name=plugin_name,
                 **kwargs: Any,
             ) -> Any:
-                before = _request_snapshot(req)
+                before = None
+                before_material = None
+                try:
+                    before = _request_snapshot(req)
+                    before_material = capture_request_material(
+                        req, _fingerprint
+                    )
+                except Exception as observer_error:
+                    logger.warning(
+                        "Unable to capture request before plugin hook "
+                        "plugin=%s handler=%s error_type=%s",
+                        _plugin_name,
+                        _handler.handler_name,
+                        type(observer_error).__name__,
+                    )
+                outcome = "completed"
+                error_type = ""
                 try:
                     result = await _original(event, req, *args, **kwargs)
+                    try:
+                        if event.is_stopped():
+                            outcome = "stopped_propagation"
+                    except Exception:
+                        pass
+                except BaseException as error:
+                    outcome = "raised"
+                    error_type = type(error).__name__
+                    raise
                 finally:
-                    after = _request_snapshot(req)
-                    changed = _changed_fields(before, after)
-                    if changed:
+                    try:
+                        after = None
+                        after_material = None
+                        changed = []
+                        delta = {}
+                        if before is not None and before_material is not None:
+                            after = _request_snapshot(req)
+                            after_material = capture_request_material(
+                                req, _fingerprint
+                            )
+                            changed = _changed_fields(before, after)
+                            delta = describe_request_mutation(
+                                before_material,
+                                after_material,
+                                _fingerprint,
+                            )
+                        else:
+                            outcome = (
+                                "observation_unavailable"
+                                if outcome == "completed"
+                                else outcome
+                            )
                         request_context = event.get_extra(
                             "_prompt_audit_request_context"
                         )
                         if not isinstance(request_context, dict):
                             request_context = {}
-                        mutation = {
+                            event.set_extra(
+                                "_prompt_audit_request_context",
+                                request_context,
+                            )
+                        handler_trace = request_context.setdefault(
+                            "handler_trace", []
+                        )
+                        trace_count = int(
+                            request_context.get("handler_trace_count", 0)
+                        ) + 1
+                        request_context["handler_trace_count"] = trace_count
+                        handler_record = {
+                            "sequence": trace_count,
                             "plugin": _plugin_name,
                             "handler": _handler.handler_name,
-                            "changed": changed,
-                        }
-                        mutations = request_context.setdefault("mutations", [])
-                        if mutation not in mutations:
-                            mutations.append(mutation)
-                        event_request_id = str(
-                            request_context.get(
-                                "request_id",
-                                getattr(
-                                    getattr(event, "trace", None),
-                                    "trace_id",
-                                    "unknown",
-                                ),
-                            )
-                        )
-                        event_session_hash = str(
-                            request_context.get(
-                                "session_hash",
-                                _fingerprint(
-                                    getattr(
-                                        event,
-                                        "unified_msg_origin",
-                                        "unknown",
-                                    )
-                                ),
-                            )
-                        )
-                        self._save_event(
-                            "mutation",
-                            event_request_id,
-                            event_session_hash,
-                            {
-                                **(
-                                    request_context.get("routing", {})
-                                    if isinstance(request_context, dict)
-                                    else {}
-                                ),
-                                "plugin": _plugin_name,
-                                "handler": _handler.handler_name,
-                                "changed": changed,
-                                "before": {
-                                    key: before[key] for key in changed
-                                },
-                                "after": {key: after[key] for key in changed},
-                            },
-                        )
-                        logger.info(
-                            "LLM request hook mutation request_id=%s plugin=%s "
-                            "handler=%s changed=%s before=%s after=%s",
-                            getattr(
-                                getattr(event, "trace", None),
-                                "trace_id",
-                                "unknown",
+                            "handler_full_name": _handler.handler_full_name,
+                            "priority": _handler.extras_configs.get(
+                                "priority", 0
                             ),
+                            "changed": changed,
+                            "delta": delta,
+                            "outcome": outcome,
+                        }
+                        if error_type:
+                            handler_record["error_type"] = error_type
+                        if len(handler_trace) < MAX_HANDLER_DETAILS:
+                            handler_trace.append(handler_record)
+                        else:
+                            request_context["handler_trace_truncated"] = True
+                        if changed:
+                            mutations = request_context.setdefault(
+                                "mutations", []
+                            )
+                            request_context["mutation_count"] = int(
+                                request_context.get("mutation_count", 0)
+                            ) + 1
+                            if len(mutations) < MAX_HANDLER_DETAILS:
+                                mutations.append(handler_record)
+                            else:
+                                request_context["mutations_truncated"] = True
+                            event_request_id = str(
+                                request_context.get(
+                                    "request_id",
+                                    getattr(
+                                        getattr(event, "trace", None),
+                                        "trace_id",
+                                        "unknown",
+                                    ),
+                                )
+                            )
+                            event_session_hash = str(
+                                request_context.get(
+                                    "session_hash",
+                                    _fingerprint(
+                                        getattr(
+                                            event,
+                                            "unified_msg_origin",
+                                            "unknown",
+                                        )
+                                    ),
+                                )
+                            )
+                            self._save_event(
+                                "mutation",
+                                event_request_id,
+                                event_session_hash,
+                                {
+                                    **request_context.get("routing", {}),
+                                    **handler_record,
+                                    "before": {
+                                        key: before[key]
+                                        for key in changed
+                                        if before is not None
+                                    },
+                                    "after": {
+                                        key: after[key]
+                                        for key in changed
+                                        if after is not None
+                                    },
+                                },
+                            )
+                            logger.info(
+                                "LLM request hook mutation request_id=%s "
+                                "plugin=%s handler=%s sequence=%s changed=%s "
+                                "delta=%s before=%s after=%s",
+                                request_context.get(
+                                    "request_id", "unknown"
+                                ),
+                                _plugin_name,
+                                _handler.handler_name,
+                                handler_record["sequence"],
+                                ",".join(changed),
+                                _stable_json(delta),
+                                _stable_json(
+                                    {
+                                        key: before[key]
+                                        for key in changed
+                                        if before is not None
+                                    }
+                                ),
+                                _stable_json(
+                                    {
+                                        key: after[key]
+                                        for key in changed
+                                        if after is not None
+                                    }
+                                ),
+                            )
+                    except Exception as observer_error:
+                        logger.warning(
+                            "Unable to inspect LLM request hook "
+                            "plugin=%s handler=%s error_type=%s",
                             _plugin_name,
                             _handler.handler_name,
-                            ",".join(changed),
-                            _stable_json(
-                                {key: before[key] for key in changed}
-                            ),
-                            _stable_json(
-                                {key: after[key] for key in changed}
-                            ),
+                            type(observer_error).__name__,
                         )
                 return result
 
@@ -1389,7 +1632,7 @@ class PromptAuditPlugin(star.Star):
             self._wrapped_handlers.append((handler, original, traced_handler))
 
         logger.info(
-            "Wrapped %s LLM request hooks for per-plugin mutation diagnostics.",
+            "Tracking %s registered LLM request hooks for per-plugin diagnostics.",
             len(self._wrapped_handlers),
         )
 
@@ -1415,12 +1658,13 @@ class PromptAuditPlugin(star.Star):
         )
         self._wrapped_handlers.clear()
 
-    @filter.on_llm_request(priority=1000000000)
+    @filter.on_llm_request(priority=9223372036854775807)
     async def capture_request_before_hooks(
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
         try:
             self._instrument_registered_providers()
+            self._wrap_registered_request_handlers()
             session_id = req.session_id or event.unified_msg_origin or "unknown"
             conversation_id = (
                 req.conversation.cid if req.conversation else None
@@ -1440,12 +1684,60 @@ class PromptAuditPlugin(star.Star):
                 "routing": routing,
                 "hook_changed": [],
                 "mutations": [],
+                "mutation_count": 0,
+                "mutations_truncated": False,
+                "handler_trace": [],
+                "handler_trace_count": 0,
+                "handler_trace_truncated": False,
+                "handler_inventory": [],
+                "handler_inventory_count": 0,
+                "handler_inventory_truncated": False,
                 "finalized": False,
                 "association_keys": self._request_association_keys(
                     session_id=session_id,
                     conversation_id=conversation_id,
                 ),
             }
+            try:
+                from astrbot.core.star.star_handler import (
+                    EventType,
+                    star_handlers_registry,
+                )
+                from astrbot.core.star.star import star_map
+
+                all_handlers = [
+                    handler
+                    for handler in star_handlers_registry
+                    if (
+                        handler.event_type == EventType.OnLLMRequestEvent
+                        and not handler.handler_module_path.startswith(
+                            f"data.plugins.{PLUGIN_NAME}."
+                        )
+                    )
+                ]
+                eligible_handlers = (
+                    star_handlers_registry.get_handlers_by_event_type(
+                        EventType.OnLLMRequestEvent,
+                        plugins_name=event.plugins_name,
+                    )
+                )
+                inventory = describe_handler_inventory(
+                    all_handlers,
+                    eligible_handlers,
+                    star_map.get,
+                )
+                request_context["handler_inventory_count"] = len(inventory)
+                request_context["handler_inventory"] = inventory[
+                    :MAX_HANDLER_DETAILS
+                ]
+                request_context["handler_inventory_truncated"] = (
+                    len(inventory) > MAX_HANDLER_DETAILS
+                )
+            except Exception as observer_error:
+                logger.warning(
+                    "Unable to inventory LLM request hooks error_type=%s",
+                    type(observer_error).__name__,
+                )
             _REQUEST_CONTEXT.set(request_context)
             event.set_extra(
                 "_prompt_audit_before",
@@ -1465,7 +1757,7 @@ class PromptAuditPlugin(star.Star):
                 type(error).__name__,
             )
 
-    @filter.on_llm_request(priority=-1000000000)
+    @filter.on_llm_request(priority=-9223372036854775808)
     async def report_request_after_hooks(
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
@@ -1554,6 +1846,56 @@ class PromptAuditPlugin(star.Star):
                         request_context.get("mutations", [])
                         if isinstance(request_context, dict)
                         else []
+                    ),
+                    "request_mutation_count": (
+                        request_context.get(
+                            "mutation_count",
+                            len(request_context.get("mutations", [])),
+                        )
+                        if isinstance(request_context, dict)
+                        else 0
+                    ),
+                    "mutations_truncated": (
+                        request_context.get("mutations_truncated", False)
+                        if isinstance(request_context, dict)
+                        else False
+                    ),
+                    "request_mutations_truncated": (
+                        request_context.get("mutations_truncated", False)
+                        if isinstance(request_context, dict)
+                        else False
+                    ),
+                    "handler_trace": (
+                        request_context.get("handler_trace", [])
+                        if isinstance(request_context, dict)
+                        else []
+                    ),
+                    "handler_trace_count": (
+                        request_context.get("handler_trace_count", 0)
+                        if isinstance(request_context, dict)
+                        else 0
+                    ),
+                    "handler_trace_truncated": (
+                        request_context.get("handler_trace_truncated", False)
+                        if isinstance(request_context, dict)
+                        else False
+                    ),
+                    "handler_inventory": (
+                        request_context.get("handler_inventory", [])
+                        if isinstance(request_context, dict)
+                        else []
+                    ),
+                    "handler_inventory_count": (
+                        request_context.get("handler_inventory_count", 0)
+                        if isinstance(request_context, dict)
+                        else 0
+                    ),
+                    "handler_inventory_truncated": (
+                        request_context.get(
+                            "handler_inventory_truncated", False
+                        )
+                        if isinstance(request_context, dict)
+                        else False
                     ),
                     "previous_turn_changed": turn_changes,
                     "previous_seen": previous is not None,

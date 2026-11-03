@@ -17,6 +17,18 @@ def test_request_export_fields_supports_existing_request_event_schema():
         "request_hook_plugins": ["plugin_a", "plugin_b"],
         "request_hook_handlers": ["handler_a", "handler_b"],
         "request_mutation_count": 2,
+        "request_mutation_chain": [
+            {"plugin": "plugin_a"},
+            {"plugin": "plugin_b"},
+        ],
+        "request_handler_trace": [],
+        "request_handler_trace_count": 0,
+        "request_handler_trace_truncated": False,
+        "request_handler_inventory": [],
+        "request_handler_inventory_count": 0,
+        "request_handler_inventory_truncated": False,
+        "request_mutations_truncated": False,
+        "provider_request_snapshot": {},
         "request_snapshot_fingerprint": "snapshot-hash",
     }
 
@@ -27,6 +39,8 @@ def test_request_export_fields_preserve_provider_association_schema():
         "request_hook_plugins": ["plugin_a"],
         "request_hook_handlers": ["handler_a"],
         "request_mutation_count": 1,
+        "request_mutation_chain": [],
+        "request_handler_trace": [],
         "request_snapshot_fingerprint": "existing-hash",
         "hook_changed": ["system"],
         "mutation_plugins": ["legacy_plugin"],
@@ -41,6 +55,15 @@ def test_request_export_fields_preserve_provider_association_schema():
         "request_hook_handlers": ["handler_a"],
         "request_mutation_count": 1,
         "request_snapshot_fingerprint": "existing-hash",
+        "request_mutation_chain": [],
+        "request_handler_trace": [],
+        "request_handler_trace_count": 0,
+        "request_handler_trace_truncated": False,
+        "request_handler_inventory": [],
+        "request_handler_inventory_count": 0,
+        "request_handler_inventory_truncated": False,
+        "request_mutations_truncated": False,
+        "provider_request_snapshot": {},
     }
 
 
@@ -52,5 +75,14 @@ def test_request_export_fields_leave_unavailable_request_metadata_blank():
         "request_hook_plugins": [],
         "request_hook_handlers": [],
         "request_mutation_count": "",
+        "request_mutation_chain": [],
+        "request_handler_trace": [],
+        "request_handler_trace_count": 0,
+        "request_handler_trace_truncated": False,
+        "request_handler_inventory": [],
+        "request_handler_inventory_count": 0,
+        "request_handler_inventory_truncated": False,
+        "request_mutations_truncated": False,
+        "provider_request_snapshot": {},
         "request_snapshot_fingerprint": "",
     }

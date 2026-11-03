@@ -1,6 +1,6 @@
 name: astrbot_plugin_prompt_audit
 display_name: LLM 缓存与请求指纹诊断
 desc: 在插件面板查看服务商报告的缓存 token 和请求指纹变化；不记录提示词或聊天原文。
-version: 0.14.1
+version: 0.15.0
 author: CJwen
 repo: https://github.com/CJwens/astrbot-plugin-prompt-audit

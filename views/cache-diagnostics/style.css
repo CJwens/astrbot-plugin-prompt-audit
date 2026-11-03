@@ -373,6 +373,12 @@ h3 {
   line-height: 1.7;
 }
 
+.hook-inventory {
+  max-height: 320px;
+  overflow: auto;
+  padding-right: 8px;
+}
+
 .badge {
   display: inline-flex;
   align-items: center;
