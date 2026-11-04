@@ -4,7 +4,7 @@
 
 - 默认分支：`main`
 - 当前工作版本：`0.17.4`
-- 最新已发布标签：`v0.17.1`（`v0.17.4` 尚未打标签）
+- 最新版本标签：`v0.17.4`（代码与标签已推送，尚未创建 GitHub Release）
 - 远程仓库：`https://github.com/CJwens/astrbot-plugin-prompt-audit.git`
 - Windows GitHub 访问不稳定时，优先使用本机 Clash 的 HTTP/Mixed 端口；当前已验证端口为 `7897`
 
