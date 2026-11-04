@@ -31,7 +31,7 @@ from .request_mutation import (
 from .routing_identity import build_routing_metadata
 
 PLUGIN_NAME = "astrbot_plugin_prompt_audit"
-PLUGIN_VERSION = "0.17.0"
+PLUGIN_VERSION = "0.17.1"
 MAX_SESSIONS = 512
 MAX_EVENTS = 10000
 MAX_HANDLER_DETAILS = 500
@@ -229,8 +229,7 @@ class PromptAuditPlugin(star.Star):
         ) as connection:
             connection.execute("PRAGMA secure_delete=ON")
             connection.execute("PRAGMA journal_mode=DELETE")
-            connection.execute(
-                """
+            create_capture_table = """
                 CREATE TABLE IF NOT EXISTS prompt_capture_requests (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     request_id TEXT NOT NULL,
@@ -242,8 +241,38 @@ class PromptAuditPlugin(star.Star):
                     text_truncated INTEGER NOT NULL,
                     payload BLOB NOT NULL
                 )
-                """
-            )
+            """
+            connection.execute(create_capture_table)
+            capture_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(prompt_capture_requests)"
+                ).fetchall()
+            }
+            if "id" not in capture_columns:
+                previous_captures = connection.execute(
+                    """
+                    SELECT request_id, captured_at, model, completion,
+                           mutation_count, mutations_truncated,
+                           text_truncated, payload
+                    FROM prompt_capture_requests
+                    """
+                ).fetchall()
+                connection.execute("DROP TABLE prompt_capture_requests")
+                connection.execute(create_capture_table)
+                connection.executemany(
+                    """
+                    INSERT INTO prompt_capture_requests (
+                        request_id, captured_at, model, completion,
+                        mutation_count, mutations_truncated,
+                        text_truncated, payload
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    previous_captures,
+                )
+                connection.commit()
+                connection.execute("VACUUM")
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_prompt_capture_requests_time "
                 "ON prompt_capture_requests(captured_at DESC, id DESC)"
@@ -258,9 +287,45 @@ class PromptAuditPlugin(star.Star):
                 "AND name='prompt_capture'"
             ).fetchone()
             if legacy_table:
-                connection.execute("DROP TABLE prompt_capture")
+                legacy_capture = connection.execute(
+                    """
+                    SELECT captured_at, request_id, model, completion,
+                           mutation_count, mutations_truncated, text_truncated,
+                           payload
+                    FROM prompt_capture
+                    WHERE id = 1
+                    """
+                ).fetchone()
+                cutoff = (
+                    datetime.now(timezone.utc)
+                    - timedelta(seconds=PROMPT_CAPTURE_RETENTION_SECONDS)
+                ).isoformat(timespec="seconds")
+                if (
+                    legacy_capture
+                    and legacy_capture[0] >= cutoff
+                    and legacy_capture[1]
+                ):
+                    legacy_payload = legacy_capture[7]
+                    if isinstance(legacy_payload, str):
+                        legacy_payload = legacy_payload.encode("utf-8")
+                    connection.execute(
+                        """
+                        INSERT INTO prompt_capture_requests (
+                            request_id, captured_at, model, completion,
+                            mutation_count, mutations_truncated, text_truncated,
+                            payload
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            legacy_capture[1],
+                            legacy_capture[0],
+                            *legacy_capture[2:7],
+                            zlib.compress(legacy_payload, level=6),
+                        ),
+                    )
+                connection.execute("DELETE FROM prompt_capture")
                 connection.commit()
-                connection.execute("VACUUM")
         self._prompt_capture_cleanup_task = asyncio.create_task(
             self._prompt_capture_cleanup_loop()
         )
@@ -316,6 +381,12 @@ class PromptAuditPlugin(star.Star):
         ) as connection:
             connection.execute("PRAGMA secure_delete=ON")
             connection.execute("DELETE FROM prompt_capture_requests")
+            legacy_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='prompt_capture'"
+            ).fetchone()
+            if legacy_table:
+                connection.execute("DELETE FROM prompt_capture")
             connection.commit()
             connection.execute("VACUUM")
 
