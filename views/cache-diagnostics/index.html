@@ -256,6 +256,35 @@
         </div>
       </section>
 
+      <section class="panel prompt-capture-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>一次性提示词原文诊断</h2>
+            <p>
+              可查看各请求钩子修改前后，以及钩子链结束时的 system prompt / prompt。
+            </p>
+          </div>
+          <span id="prompt-capture-status" class="updated">原文采集默认关闭</span>
+        </div>
+        <div class="prompt-capture-warning">
+          <strong>采集范围：</strong>
+          点击后采集下一次请求，最多等待 10 分钟；展示每个改动处理器的前后原文及钩子链结束值。原文保存在插件本地独立数据库，24 小时后自动删除，也可立即清除；不进入普通日志或 CSV。
+          只覆盖 system prompt / prompt，不含上下文、工具参数或中转商最终 HTTP 请求。
+        </div>
+        <div class="prompt-capture-controls">
+          <button id="prompt-capture-arm" class="refresh-button" type="button">
+            采集下一次请求
+          </button>
+          <button id="prompt-capture-view" class="refresh-button" type="button" hidden>
+            查看捕获原文
+          </button>
+          <button id="prompt-capture-clear" class="refresh-button" type="button" hidden>
+            清除原文
+          </button>
+        </div>
+        <div id="prompt-capture-content" class="prompt-capture-content" hidden></div>
+      </section>
+
       <div id="group-modal" class="modal" hidden>
         <div class="modal-backdrop" data-close-modal></div>
         <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="group-modal-title">

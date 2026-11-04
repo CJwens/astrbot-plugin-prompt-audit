@@ -86,3 +86,29 @@ def test_request_export_fields_leave_unavailable_request_metadata_blank():
         "provider_request_snapshot": {},
         "request_snapshot_fingerprint": "",
     }
+
+
+def test_request_export_never_includes_optional_prompt_capture_text():
+    result = request_export_fields(
+        {
+            "initial": {"system": {"text": "private system"}},
+            "mutations": [
+                {
+                    "plugin": "plugin-a",
+                    "fields": {
+                        "system": {
+                            "before": {"text": "before"},
+                            "after": {"text": "after"},
+                        }
+                    },
+                }
+            ],
+            "final": {"system": {"text": "private final"}},
+        },
+        lambda snapshot: "snapshot-hash",
+    )
+
+    assert "private" not in repr(result)
+    assert "initial" not in result
+    assert "mutations" not in result
+    assert "final" not in result

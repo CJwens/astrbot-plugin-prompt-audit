@@ -18,6 +18,8 @@ let selectedGroupHash = "";
 let currentGroupDetail = null;
 let loadInProgress = false;
 let reloadRequested = false;
+let promptCaptureArmed = false;
+let promptCaptureVisible = false;
 
 function formatTime(value) {
   const date = new Date(value);
@@ -92,6 +94,166 @@ function detailItem(label, value) {
   content.textContent = compactJson(value);
   item.append(key, content);
   return item;
+}
+
+function appendPromptSnapshot(container, title, snapshot) {
+  const section = document.createElement("details");
+  section.className = "prompt-capture-stage";
+  const summary = document.createElement("summary");
+  summary.textContent = title;
+  section.append(summary);
+  for (const field of ["system", "prompt"]) {
+    const value = snapshot?.[field];
+    if (!value) continue;
+    const fieldSection = document.createElement("div");
+    fieldSection.className = "prompt-capture-field";
+    const label = document.createElement("strong");
+    label.textContent = field === "system" ? "System prompt" : "Prompt";
+    const size = document.createElement("span");
+    size.className = value.truncated
+      ? "prompt-capture-truncated"
+      : "prompt-capture-meta";
+    size.textContent = ` · ${formatTokens(value.chars)} 字符${
+      value.truncated ? " · 已截断，非完整原文" : ""
+    }`;
+    const text = document.createElement("pre");
+    text.textContent = value.text || "";
+    fieldSection.append(label, size, text);
+    section.append(fieldSection);
+  }
+  container.append(section);
+}
+
+function renderPromptCapture(capture) {
+  const container = byId("prompt-capture-content");
+  container.replaceChildren();
+  const completionLabels = {
+    complete: "已观察到请求钩子链结束",
+    stopped_propagation: "处理器停止了后续钩子",
+    raised: "处理器执行异常，以下是异常前最后观察到的内容",
+  };
+  const title = document.createElement("h3");
+  title.textContent = "本次捕获";
+  const metadata = document.createElement("div");
+  metadata.className = "prompt-capture-meta";
+  metadata.textContent = [
+    `时间 ${formatTime(capture.captured_at)}`,
+    `模型 ${capture.model || "未知"}`,
+    `请求 ${capture.request_id || "未知"}`,
+    completionLabels[capture.completion] || capture.completion || "状态未知",
+    `观察到 ${capture.mutation_count || 0} 个提示词改动处理器`,
+  ].join(" · ");
+  container.append(title, metadata);
+  if (capture.text_truncated || capture.mutations_truncated) {
+    const warning = document.createElement("div");
+    warning.className = "prompt-capture-truncated";
+    warning.textContent = [
+      capture.text_truncated ? "部分长文本已截断。" : "",
+      capture.mutations_truncated ? "改动处理器数量达到上限，后续未展示。" : "",
+    ].filter(Boolean).join(" ");
+    container.append(warning);
+  }
+  appendPromptSnapshot(container, "初始提示词（所有请求钩子执行前）", capture.initial);
+  for (const mutation of capture.mutations || []) {
+    const stage = document.createElement("section");
+    stage.className = "prompt-capture-stage";
+    const heading = document.createElement("h4");
+    heading.textContent = `#${mutation.sequence} ${mutation.plugin} · ${mutation.handler}`;
+    stage.append(heading);
+    for (const field of ["system", "prompt"]) {
+      const change = mutation.fields?.[field];
+      if (!change) continue;
+      const details = document.createElement("details");
+      details.open = false;
+      const summary = document.createElement("summary");
+      summary.textContent = field === "system" ? "System prompt 改动" : "Prompt 改动";
+      details.append(summary);
+      const beforeAfter = document.createElement("div");
+      beforeAfter.className = "prompt-capture-field";
+      for (const [label, value] of [
+        ["修改前", change.before],
+        ["修改后", change.after],
+      ]) {
+        const block = document.createElement("div");
+        const fieldLabel = document.createElement("strong");
+        fieldLabel.textContent = label;
+        const size = document.createElement("span");
+        size.className = value.truncated
+          ? "prompt-capture-truncated"
+          : "prompt-capture-meta";
+        size.textContent = ` · ${formatTokens(value.chars)} 字符${
+          value.truncated ? " · 已截断" : ""
+        }`;
+        const text = document.createElement("pre");
+        text.textContent = value.text || "";
+        block.append(fieldLabel, size, text);
+        beforeAfter.append(block);
+      }
+      details.replaceChildren(summary, beforeAfter);
+      stage.append(details);
+    }
+    container.append(stage);
+  }
+  appendPromptSnapshot(container, "最终提示词（钩子链结束时）", capture.final);
+  container.hidden = false;
+  promptCaptureVisible = true;
+  byId("prompt-capture-view").textContent = "隐藏捕获原文";
+}
+
+async function refreshPromptCaptureStatus() {
+  try {
+    const result = await bridge.apiGet("prompt-capture-status");
+    promptCaptureArmed = Boolean(result.armed);
+    byId("prompt-capture-status").textContent = promptCaptureArmed
+      ? `已开启：等待下一次请求（约 ${Math.ceil(
+          (result.expires_in_seconds || 0) / 60
+        )} 分钟后超时）`
+      : result.capture_available
+        ? `已捕获 ${formatTime(result.capture.captured_at)} · 原文保留至多 24 小时`
+        : "原文采集默认关闭";
+    byId("prompt-capture-arm").textContent = promptCaptureArmed
+      ? "取消本次采集"
+      : "采集下一次请求";
+    byId("prompt-capture-view").hidden = !result.capture_available;
+    byId("prompt-capture-clear").hidden =
+      !result.capture_available && !promptCaptureArmed;
+    if (!result.capture_available) {
+      byId("prompt-capture-view").textContent = "查看捕获原文";
+    }
+    if (!result.capture_available && promptCaptureVisible) {
+      byId("prompt-capture-content").replaceChildren();
+      byId("prompt-capture-content").hidden = true;
+      promptCaptureVisible = false;
+    }
+  } catch (error) {
+    byId("prompt-capture-status").textContent =
+      `原文诊断状态读取失败：${error.message || "请重试"}`;
+  }
+}
+
+async function controlPromptCapture(action) {
+  const result = await bridge.apiPost("prompt-capture-control", { action });
+  if (!result.ok) throw new Error(result.error || "操作失败");
+  byId("prompt-capture-content").replaceChildren();
+  byId("prompt-capture-content").hidden = true;
+  promptCaptureVisible = false;
+  await refreshPromptCaptureStatus();
+}
+
+async function viewPromptCapture() {
+  if (promptCaptureVisible) {
+    byId("prompt-capture-content").replaceChildren();
+    byId("prompt-capture-content").hidden = true;
+    promptCaptureVisible = false;
+    byId("prompt-capture-view").textContent = "查看捕获原文";
+    return;
+  }
+  const result = await bridge.apiGet("prompt-capture-detail");
+  if (!result.capture) {
+    await refreshPromptCaptureStatus();
+    return;
+  }
+  renderPromptCapture(result.capture);
 }
 
 function mutationDeltaSummary(delta = {}) {
@@ -803,6 +965,7 @@ async function load() {
           ? `另有 ${formatTokens(unattributed)} 条 usage 未能安全归属到群或用户。`
           : ""
       }`;
+    await refreshPromptCaptureStatus();
   } catch (error) {
     byId("notice").textContent = `读取失败：${error.message || "请确认插件已启用并重载"}`;
     byId("notice").className = "notice error";
@@ -852,6 +1015,34 @@ async function exportCsv() {
 await bridge.ready();
 byId("refresh").addEventListener("click", load);
 byId("export").addEventListener("click", exportCsv);
+byId("prompt-capture-arm").addEventListener("click", async () => {
+  try {
+    if (promptCaptureArmed) {
+      await controlPromptCapture("disarm");
+      return;
+    }
+    await controlPromptCapture("arm");
+  } catch (error) {
+    byId("prompt-capture-status").textContent =
+      `采集控制失败：${error.message || "请重试"}`;
+  }
+});
+byId("prompt-capture-view").addEventListener("click", async () => {
+  try {
+    await viewPromptCapture();
+  } catch (error) {
+    byId("prompt-capture-status").textContent =
+      `原文读取失败：${error.message || "请重试"}`;
+  }
+});
+byId("prompt-capture-clear").addEventListener("click", async () => {
+  try {
+    await controlPromptCapture("clear");
+  } catch (error) {
+    byId("prompt-capture-status").textContent =
+      `原文清除失败：${error.message || "请重试"}`;
+  }
+});
 byId("scope-tab-groups").addEventListener("click", () =>
   setScopeMode("groups")
 );
@@ -904,6 +1095,7 @@ bridge.onContext(() => {
     bridge.getContext()?.isDark ? "dark" : "light";
 });
 load();
+refreshPromptCaptureStatus();
 window.setInterval(() => {
   if (document.visibilityState === "visible") load();
 }, 30_000);

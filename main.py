@@ -1,7 +1,9 @@
+import asyncio
 import hashlib
 import inspect
 import json
 import sqlite3
+from threading import Lock
 from contextvars import ContextVar
 from collections import OrderedDict
 from dataclasses import asdict, is_dataclass
@@ -19,6 +21,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .request_association import RequestAssociationRegistry
 from .request_export import request_export_fields
+from .prompt_capture import PromptCaptureBuffer, capture_prompt_request
 from .request_mutation import (
     capture_request_material,
     capture_provider_request_snapshot,
@@ -28,12 +31,16 @@ from .request_mutation import (
 from .routing_identity import build_routing_metadata
 
 PLUGIN_NAME = "astrbot_plugin_prompt_audit"
+PLUGIN_VERSION = "0.16.0"
 MAX_SESSIONS = 512
 MAX_EVENTS = 10000
 MAX_HANDLER_DETAILS = 500
 RETENTION_DAYS = 30
 ASSOCIATION_TTL_SECONDS = 180.0
 NAME_LOOKUP_TTL_SECONDS = 300.0
+PROMPT_CAPTURE_RETENTION_SECONDS = 24 * 60 * 60
+PROMPT_CAPTURE_ARM_SECONDS = 10 * 60
+PROMPT_CAPTURE_EXTRA = "_prompt_audit_prompt_capture"
 _REQUEST_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
     "prompt_audit_request_context", default=None
 )
@@ -131,7 +138,7 @@ def _changed_fields(
     PLUGIN_NAME,
     "CJwen",
     "Inspect provider-reported cache usage and LLM request fingerprint changes.",
-    "0.15.0",
+    PLUGIN_VERSION,
 )
 class PromptAuditPlugin(star.Star):
     def __init__(self, context: star.Context) -> None:
@@ -141,6 +148,14 @@ class PromptAuditPlugin(star.Star):
         self._database = (
             Path(get_astrbot_plugin_data_path()) / PLUGIN_NAME / "diagnostics.db"
         )
+        self._prompt_capture_database = (
+            Path(get_astrbot_plugin_data_path())
+            / PLUGIN_NAME
+            / "prompt-capture.sqlite3"
+        )
+        self._prompt_capture_lock = Lock()
+        self._prompt_capture_deadline = 0.0
+        self._prompt_capture_expiry_task: asyncio.Task | None = None
         self._instrumented_providers: dict[
             int, tuple[Provider, Any, Any, Any, Any]
         ] = {}
@@ -162,6 +177,24 @@ class PromptAuditPlugin(star.Star):
             self.export_data,
             ["GET"],
             "Export bounded cache and prompt diagnostics without prompt contents.",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/prompt-capture-status",
+            self.prompt_capture_status,
+            ["GET"],
+            "Read one-shot prompt capture status without prompt contents.",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/prompt-capture-detail",
+            self.prompt_capture_detail,
+            ["GET"],
+            "Read the explicitly captured prompt text for dashboard display.",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/prompt-capture-control",
+            self.prompt_capture_control,
+            ["POST"],
+            "Arm one-shot prompt capture or clear captured prompt text.",
         )
 
     async def initialize(self) -> None:
@@ -190,15 +223,278 @@ class PromptAuditPlugin(star.Star):
                 "CREATE INDEX IF NOT EXISTS idx_diagnostic_events_kind_created "
                 "ON diagnostic_events(kind, created_at DESC)"
             )
+        self._prompt_capture_database.parent.mkdir(
+            parents=True, exist_ok=True
+        )
+        with sqlite3.connect(
+            self._prompt_capture_database, timeout=5
+        ) as connection:
+            connection.execute("PRAGMA secure_delete=ON")
+            connection.execute("PRAGMA journal_mode=DELETE")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS prompt_capture (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    captured_at TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    completion TEXT NOT NULL,
+                    mutation_count INTEGER NOT NULL,
+                    mutations_truncated INTEGER NOT NULL,
+                    text_truncated INTEGER NOT NULL,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            self._delete_expired_prompt_capture(connection)
         self._instrument_registered_providers()
         logger.info(
             "LLM request fingerprint and provider-reported cache usage diagnostics "
-            "enabled; prompt contents are not logged. Dashboard data retention: "
-            "%s days, max %s events; request association TTL: %ss.",
+            "enabled; prompt contents are not logged or exported. One-shot prompt "
+            "text capture is off by default, limited to system/prompt, and retained "
+            "for at most %s hours. Dashboard data retention: %s days, max %s events; "
+            "request association TTL: %ss.",
+            PROMPT_CAPTURE_RETENTION_SECONDS // 3600,
             RETENTION_DAYS,
             MAX_EVENTS,
             int(ASSOCIATION_TTL_SECONDS),
         )
+
+    @staticmethod
+    def _delete_expired_prompt_capture(
+        connection: sqlite3.Connection,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        cutoff = (
+            (now or datetime.now(timezone.utc))
+            - timedelta(seconds=PROMPT_CAPTURE_RETENTION_SECONDS)
+        ).isoformat(timespec="seconds")
+        connection.execute(
+            "DELETE FROM prompt_capture WHERE captured_at < ?", (cutoff,)
+        )
+
+    def _cancel_prompt_capture_expiry(self) -> None:
+        task = self._prompt_capture_expiry_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._prompt_capture_expiry_task = None
+
+    def _clear_prompt_capture_record(self) -> None:
+        with sqlite3.connect(
+            self._prompt_capture_database, timeout=5
+        ) as connection:
+            connection.execute("PRAGMA secure_delete=ON")
+            connection.execute("DELETE FROM prompt_capture")
+            connection.commit()
+            connection.execute("VACUUM")
+
+    @staticmethod
+    async def _expire_prompt_capture(
+        database: Path,
+        captured_at: str,
+    ) -> None:
+        try:
+            await asyncio.sleep(PROMPT_CAPTURE_RETENTION_SECONDS)
+            with sqlite3.connect(
+                database, timeout=5
+            ) as connection:
+                connection.execute("PRAGMA secure_delete=ON")
+                connection.execute(
+                    "DELETE FROM prompt_capture WHERE captured_at = ?",
+                    (captured_at,),
+                )
+                connection.commit()
+                connection.execute("VACUUM")
+        except asyncio.CancelledError:
+            raise
+        except sqlite3.Error as error:
+            logger.warning(
+                "Unable to expire one-shot prompt capture error_type=%s",
+                type(error).__name__,
+            )
+
+    def _store_prompt_capture(self, payload: dict[str, Any]) -> None:
+        with sqlite3.connect(
+            self._prompt_capture_database, timeout=5
+        ) as connection:
+            connection.execute("PRAGMA secure_delete=ON")
+            self._delete_expired_prompt_capture(connection)
+            connection.execute("DELETE FROM prompt_capture")
+            connection.execute(
+                """
+                INSERT INTO prompt_capture (
+                    id, captured_at, request_id, model, completion,
+                    mutation_count, mutations_truncated, text_truncated, payload
+                )
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload["captured_at"],
+                    payload["request_id"],
+                    payload["model"],
+                    payload["completion"],
+                    payload["mutation_count"],
+                    int(payload["mutations_truncated"]),
+                    int(payload["text_truncated"]),
+                    _stable_json(payload),
+                ),
+            )
+        self._cancel_prompt_capture_expiry()
+        self._prompt_capture_expiry_task = asyncio.create_task(
+            self._expire_prompt_capture(
+                self._prompt_capture_database,
+                payload["captured_at"],
+            )
+        )
+
+    def _claim_prompt_capture(self) -> bool:
+        with self._prompt_capture_lock:
+            if self._prompt_capture_deadline <= monotonic():
+                self._prompt_capture_deadline = 0.0
+                return False
+            self._prompt_capture_deadline = 0.0
+            return True
+
+    def _prompt_capture_status(self) -> dict[str, Any]:
+        with self._prompt_capture_lock:
+            remaining = max(
+                0.0, self._prompt_capture_deadline - monotonic()
+            )
+            if remaining <= 0:
+                self._prompt_capture_deadline = 0.0
+        with sqlite3.connect(
+            self._prompt_capture_database, timeout=5
+        ) as connection:
+            connection.execute("PRAGMA secure_delete=ON")
+            connection.row_factory = sqlite3.Row
+            self._delete_expired_prompt_capture(connection)
+            row = connection.execute(
+                """
+                SELECT captured_at, request_id, model, completion,
+                       mutation_count, mutations_truncated, text_truncated
+                FROM prompt_capture WHERE id = 1
+                """
+            ).fetchone()
+        metadata = (
+            {
+                "captured_at": row["captured_at"],
+                "request_id": row["request_id"],
+                "model": row["model"],
+                "completion": row["completion"],
+                "mutation_count": row["mutation_count"],
+                "mutations_truncated": bool(row["mutations_truncated"]),
+                "text_truncated": bool(row["text_truncated"]),
+            }
+            if row is not None
+            else {}
+        )
+        return {
+            "armed": remaining > 0,
+            "expires_in_seconds": int(remaining),
+            "capture_available": row is not None,
+            "capture": metadata,
+            "retention_hours": PROMPT_CAPTURE_RETENTION_SECONDS // 3600,
+        }
+
+    async def prompt_capture_status(self):
+        return json_response(self._prompt_capture_status())
+
+    async def prompt_capture_detail(self):
+        with sqlite3.connect(
+            self._prompt_capture_database, timeout=5
+        ) as connection:
+            connection.execute("PRAGMA secure_delete=ON")
+            connection.row_factory = sqlite3.Row
+            self._delete_expired_prompt_capture(connection)
+            row = connection.execute(
+                "SELECT payload FROM prompt_capture WHERE id = 1"
+            ).fetchone()
+        return json_response(
+            {
+                "capture": json.loads(row["payload"]) if row else None,
+            }
+        )
+
+    async def prompt_capture_control(self):
+        payload = await request.json(default={})
+        action = payload.get("action") if isinstance(payload, dict) else None
+        if action == "arm":
+            self._clear_prompt_capture_record()
+            with self._prompt_capture_lock:
+                self._prompt_capture_deadline = (
+                    monotonic() + PROMPT_CAPTURE_ARM_SECONDS
+                )
+            self._cancel_prompt_capture_expiry()
+            return json_response(
+                {
+                    "ok": True,
+                    **self._prompt_capture_status(),
+                }
+            )
+        if action == "clear":
+            with self._prompt_capture_lock:
+                self._prompt_capture_deadline = 0.0
+            self._cancel_prompt_capture_expiry()
+            self._clear_prompt_capture_record()
+            return json_response(
+                {
+                    "ok": True,
+                    **self._prompt_capture_status(),
+                }
+            )
+        if action == "disarm":
+            with self._prompt_capture_lock:
+                self._prompt_capture_deadline = 0.0
+            return json_response(
+                {
+                    "ok": True,
+                    **self._prompt_capture_status(),
+                }
+            )
+        return json_response(
+            {
+                "ok": False,
+                "error": "action must be 'arm', 'disarm', or 'clear'",
+            }
+        )
+
+    def _finish_prompt_capture(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+        *,
+        completion: str,
+    ) -> None:
+        buffer = event.get_extra(PROMPT_CAPTURE_EXTRA)
+        if not isinstance(buffer, PromptCaptureBuffer):
+            return
+        event.set_extra(PROMPT_CAPTURE_EXTRA, None)
+        try:
+            result = buffer.finish(
+                final=capture_prompt_request(req),
+                completion=completion,
+            )
+            self._store_prompt_capture(result)
+            logger.info(
+                "One-shot prompt text capture completed request_id=%s "
+                "model=%s completion=%s handler_changes=%s truncated=%s",
+                result["request_id"],
+                result["model"],
+                completion,
+                result["mutation_count"],
+                (
+                    result["text_truncated"]
+                    or result["mutations_truncated"]
+                ),
+            )
+        except Exception as error:
+            logger.warning(
+                "Unable to persist one-shot prompt capture "
+                "request_id=%s error_type=%s",
+                buffer.request_id,
+                type(error).__name__,
+            )
 
     @staticmethod
     def _association_key(label: str, value: Any) -> str:
@@ -1534,6 +1830,21 @@ class PromptAuditPlugin(star.Star):
                         }
                         if error_type:
                             handler_record["error_type"] = error_type
+                        capture_buffer = event.get_extra(
+                            PROMPT_CAPTURE_EXTRA
+                        )
+                        if (
+                            isinstance(capture_buffer, PromptCaptureBuffer)
+                            and before_material is not None
+                            and after_material is not None
+                        ):
+                            capture_buffer.record_handler_change(
+                                sequence=trace_count,
+                                plugin=_plugin_name,
+                                handler=_handler.handler_name,
+                                before=before_material,
+                                after=after_material,
+                            )
                         if len(handler_trace) < MAX_HANDLER_DETAILS:
                             handler_trace.append(handler_record)
                         else:
@@ -1625,6 +1936,12 @@ class PromptAuditPlugin(star.Star):
                             _handler.handler_name,
                             type(observer_error).__name__,
                         )
+                    if outcome in {"stopped_propagation", "raised"}:
+                        self._finish_prompt_capture(
+                            event,
+                            req,
+                            completion=outcome,
+                        )
                 return result
 
             traced_handler._prompt_audit_wrapper = True
@@ -1637,6 +1954,8 @@ class PromptAuditPlugin(star.Star):
         )
 
     async def terminate(self) -> None:
+        with self._prompt_capture_lock:
+            self._prompt_capture_deadline = 0.0
         for (
             provider,
             original_text_chat,
@@ -1751,6 +2070,23 @@ class PromptAuditPlugin(star.Star):
                 "_prompt_audit_request_context",
                 request_context,
             )
+            if self._claim_prompt_capture():
+                try:
+                    event.set_extra(
+                        PROMPT_CAPTURE_EXTRA,
+                        PromptCaptureBuffer(
+                            request_id=request_id,
+                            model=req.model or "provider-default",
+                            initial=capture_prompt_request(req),
+                        ),
+                    )
+                except Exception as observer_error:
+                    logger.warning(
+                        "Unable to initialize one-shot prompt capture "
+                        "request_id=%s error_type=%s",
+                        request_id,
+                        type(observer_error).__name__,
+                    )
         except Exception as error:
             logger.warning(
                 "Unable to capture initial LLM request fingerprint: %s",
@@ -1761,6 +2097,7 @@ class PromptAuditPlugin(star.Star):
     async def report_request_after_hooks(
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
+        self._finish_prompt_capture(event, req, completion="complete")
         before = event.get_extra("_prompt_audit_before")
         if not isinstance(before, dict):
             logger.warning(

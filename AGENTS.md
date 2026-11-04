@@ -10,8 +10,10 @@
 
 ## Privacy and lifecycle
 
-- Never persist or log prompts, conversation text, tool arguments, credentials, raw session IDs, or raw conversation IDs.
+- By default, never persist or log prompts, conversation text, tool arguments, credentials, raw session IDs, or raw conversation IDs.
+- The only prompt-text exception is the dashboard's explicitly armed one-shot capture: it may persist only `system_prompt` and `prompt` for the next request, capped at 100,000 characters per text value and 32 changed handlers, in a separate local database for at most 24 hours. Keep it out of ordinary logs and CSV exports, provide immediate deletion, and do not capture contexts, tool arguments, credentials, or provider wire payloads.
 - Persist only bounded metadata, hashes, token counters, and provider/model identifiers needed for diagnosis.
+- Any UI that reveals captured prompt text must use text-only DOM rendering and clearly state the privacy and coverage limits before arming capture.
 - Any monkey-patched method or handler must be restored only if it is still the wrapper installed by this plugin. Never overwrite a wrapper installed later by another extension.
 - Observer failures must not change or fail the user's LLM request.
 - Prefer a plugin-only implementation over an AstrBot core fork; state clearly when plugin instrumentation relies on internal interfaces rather than a stable public API.
