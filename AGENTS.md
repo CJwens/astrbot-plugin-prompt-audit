@@ -10,10 +10,12 @@
 
 ## Privacy and lifecycle
 
-- By default, never persist or log prompts, conversation text, tool arguments, credentials, raw session IDs, or raw conversation IDs.
-- The only prompt-text exception is the dashboard's explicitly armed one-shot capture: it may persist only `system_prompt` and `prompt` for the next request, capped at 100,000 characters per text value and 32 changed handlers, in a separate local database for at most 24 hours. Keep it out of ordinary logs and CSV exports, provide immediate deletion, and do not capture contexts, tool arguments, credentials, or provider wire payloads.
+- Never log or export prompts, conversation text, tool arguments, credentials, raw session IDs, or raw conversation IDs.
+- Automatically persist `system_prompt` and `prompt` only for requests where a registered `on_llm_request` handler changes either field. Store initial/final text and per-handler before/after text in the separate local prompt database; cap each text value at 100,000 characters, changed handlers at 32, per-handler mutation text at 200,000 characters, retained requests at 100, and retention at 24 hours.
+- Keep prompt text out of ordinary diagnostic events, logs, and CSV exports. Load it only on demand in the matching request detail, use text-only DOM rendering, and provide immediate deletion.
+- Do not capture contexts, conversation history, tool arguments, credentials, or provider wire payloads.
 - Persist only bounded metadata, hashes, token counters, and provider/model identifiers needed for diagnosis.
-- Any UI that reveals captured prompt text must use text-only DOM rendering and clearly state the privacy and coverage limits before arming capture.
+- Any UI that reveals captured prompt text must use text-only DOM rendering and clearly state the capture and observation limits.
 - Any monkey-patched method or handler must be restored only if it is still the wrapper installed by this plugin. Never overwrite a wrapper installed later by another extension.
 - Observer failures must not change or fail the user's LLM request.
 - Prefer a plugin-only implementation over an AstrBot core fork; state clearly when plugin instrumentation relies on internal interfaces rather than a stable public API.

@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from astrbot_plugin_prompt_audit.prompt_capture import (
     MAX_CAPTURED_HANDLER_CHANGES,
+    MAX_CAPTURED_MUTATION_TEXT_CHARS,
     MAX_PROMPT_TEXT_CHARS,
     PromptCaptureBuffer,
     capture_prompt_request,
@@ -44,6 +45,8 @@ def test_capture_records_per_handler_text_and_final_text():
     )
     assert result["final"]["system"]["text"] == "base system plus rules"
     assert result["completion"] == "complete"
+    assert result["has_prompt_changes"] is True
+    assert result["final_changed_fields"] == ["system"]
 
 
 def test_capture_ignores_unchanged_and_non_prompt_fields():
@@ -63,6 +66,55 @@ def test_capture_ignores_unchanged_and_non_prompt_fields():
 
     assert buffer.mutations == []
     assert buffer.mutation_count == 0
+    result = buffer.finish(
+        final=_snapshot("system", "prompt"),
+        completion="complete",
+    )
+    assert result["has_prompt_changes"] is False
+
+
+def test_capture_keeps_final_text_when_handler_change_was_not_observed():
+    buffer = PromptCaptureBuffer(
+        request_id="request-final-only",
+        model="model-a",
+        initial=_snapshot("before system", "prompt"),
+    )
+
+    result = buffer.finish(
+        final=_snapshot("after system", "prompt"),
+        completion="complete",
+    )
+
+    assert result["has_prompt_changes"] is True
+    assert result["mutation_count"] == 0
+    assert result["final_changed_fields"] == ["system"]
+    assert result["final"]["system"]["text"] == "after system"
+
+
+def test_capture_caps_total_per_handler_prompt_text():
+    buffer = PromptCaptureBuffer(
+        request_id="request-text-budget",
+        model="model-a",
+        initial=_snapshot("", ""),
+    )
+    for sequence in range(2):
+        buffer.record_handler_change(
+            sequence=sequence,
+            plugin=f"plugin-{sequence}",
+            handler="inject",
+            before={"system": "x" * 100_000, "prompt": ""},
+            after={"system": "y" * 100_000, "prompt": ""},
+        )
+
+    result = buffer.finish(
+        final=_snapshot("y" * 100_000, ""),
+        completion="complete",
+    )
+
+    assert result["mutation_text_chars"] == MAX_CAPTURED_MUTATION_TEXT_CHARS
+    assert len(result["mutations"]) == 1
+    assert result["mutation_count"] == 2
+    assert result["mutations_truncated"] is True
 
 
 def test_capture_truncates_large_text_and_limits_handler_details():

@@ -169,6 +169,26 @@ select {
   margin-top: 18px;
 }
 
+.prompt-capture-inline {
+  display: grid;
+  gap: 10px;
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.prompt-capture-inline h4 {
+  margin: 0;
+}
+
+.prompt-capture-inline-content {
+  min-width: 0;
+}
+
+.prompt-capture-inline-content[hidden] {
+  display: none;
+}
+
 .prompt-capture-content h3,
 .prompt-capture-content h4 {
   margin: 0;

@@ -3,8 +3,8 @@
 ## 当前状态
 
 - 默认分支：`main`
-- 当前版本：`0.16.0`
-- 当前标签：`v0.16.0`
+- 当前版本：`0.17.0`
+- 当前标签：`v0.17.0`
 - 远程仓库：`https://github.com/CJwens/astrbot-plugin-prompt-audit.git`
 - Windows GitHub 访问不稳定时，优先使用本机 Clash 的 HTTP/Mixed 端口；当前已验证端口为 `7897`
 

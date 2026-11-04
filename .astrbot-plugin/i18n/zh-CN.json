@@ -2,7 +2,7 @@
   "views": {
     "cache-diagnostics": {
       "title": "缓存诊断面板",
-      "description": "查看缓存 token、请求指纹与逐插件提示词改动；支持一次性查看提示词原文。"
+      "description": "查看缓存 token、请求指纹与逐插件自动提示词原文改动。"
     }
   }
 }

@@ -18,8 +18,6 @@ let selectedGroupHash = "";
 let currentGroupDetail = null;
 let loadInProgress = false;
 let reloadRequested = false;
-let promptCaptureArmed = false;
-let promptCaptureVisible = false;
 
 function formatTime(value) {
   const date = new Date(value);
@@ -125,15 +123,15 @@ function appendPromptSnapshot(container, title, snapshot) {
 }
 
 function renderPromptCapture(capture) {
-  const container = byId("prompt-capture-content");
-  container.replaceChildren();
+  const container = document.createElement("div");
+  container.className = "prompt-capture-content";
   const completionLabels = {
     complete: "已观察到请求钩子链结束",
     stopped_propagation: "处理器停止了后续钩子",
     raised: "处理器执行异常，以下是异常前最后观察到的内容",
   };
   const title = document.createElement("h3");
-  title.textContent = "本次捕获";
+  title.textContent = "本次请求提示词改动";
   const metadata = document.createElement("div");
   metadata.className = "prompt-capture-meta";
   metadata.textContent = [
@@ -153,7 +151,19 @@ function renderPromptCapture(capture) {
     ].filter(Boolean).join(" ");
     container.append(warning);
   }
-  appendPromptSnapshot(container, "初始提示词（所有请求钩子执行前）", capture.initial);
+  if (capture.mutation_count === 0 && capture.final_changed_fields?.length) {
+    const warning = document.createElement("div");
+    warning.className = "prompt-capture-truncated";
+    warning.textContent = `请求钩子链结束时发现字段变化（${capture.final_changed_fields.join(
+      ", "
+    )}），但未观察到具体修改处理器；可能发生在已包装处理器之外。`;
+    container.append(warning);
+  }
+  appendPromptSnapshot(
+    container,
+    "钩子执行前原文",
+    capture.initial
+  );
   for (const mutation of capture.mutations || []) {
     const stage = document.createElement("section");
     stage.className = "prompt-capture-stage";
@@ -194,66 +204,107 @@ function renderPromptCapture(capture) {
     }
     container.append(stage);
   }
-  appendPromptSnapshot(container, "最终提示词（钩子链结束时）", capture.final);
-  container.hidden = false;
-  promptCaptureVisible = true;
-  byId("prompt-capture-view").textContent = "隐藏捕获原文";
+  appendPromptSnapshot(container, "钩子链结束时最终原文", capture.final);
+  return container;
 }
 
 async function refreshPromptCaptureStatus() {
   try {
     const result = await bridge.apiGet("prompt-capture-status");
-    promptCaptureArmed = Boolean(result.armed);
-    byId("prompt-capture-status").textContent = promptCaptureArmed
-      ? `已开启：等待下一次请求（约 ${Math.ceil(
-          (result.expires_in_seconds || 0) / 60
-        )} 分钟后超时）`
-      : result.capture_available
-        ? `已捕获 ${formatTime(result.capture.captured_at)} · 原文保留至多 24 小时`
-        : "原文采集默认关闭";
-    byId("prompt-capture-arm").textContent = promptCaptureArmed
-      ? "取消本次采集"
-      : "采集下一次请求";
-    byId("prompt-capture-view").hidden = !result.capture_available;
-    byId("prompt-capture-clear").hidden =
-      !result.capture_available && !promptCaptureArmed;
-    if (!result.capture_available) {
-      byId("prompt-capture-view").textContent = "查看捕获原文";
-    }
-    if (!result.capture_available && promptCaptureVisible) {
-      byId("prompt-capture-content").replaceChildren();
-      byId("prompt-capture-content").hidden = true;
-      promptCaptureVisible = false;
-    }
+    const count = Number(result.capture_count) || 0;
+    const latest = result.latest_capture_at
+      ? ` · 最近 ${formatTime(result.latest_capture_at)}`
+      : "";
+    byId("prompt-capture-status").textContent =
+      `当前保留 ${count} 条 / 最多 ${result.max_records || 100} 条${latest}`;
+    byId("prompt-capture-clear").disabled = count === 0;
+    byId("prompt-capture-clear").hidden = count === 0;
   } catch (error) {
     byId("prompt-capture-status").textContent =
-      `原文诊断状态读取失败：${error.message || "请重试"}`;
+      `记录状态读取失败：${error.message || "请重试"}`;
   }
 }
 
-async function controlPromptCapture(action) {
-  const result = await bridge.apiPost("prompt-capture-control", { action });
-  if (!result.ok) throw new Error(result.error || "操作失败");
-  byId("prompt-capture-content").replaceChildren();
-  byId("prompt-capture-content").hidden = true;
-  promptCaptureVisible = false;
-  await refreshPromptCaptureStatus();
-}
-
-async function viewPromptCapture() {
-  if (promptCaptureVisible) {
-    byId("prompt-capture-content").replaceChildren();
-    byId("prompt-capture-content").hidden = true;
-    promptCaptureVisible = false;
-    byId("prompt-capture-view").textContent = "查看捕获原文";
-    return;
-  }
-  const result = await bridge.apiGet("prompt-capture-detail");
-  if (!result.capture) {
+async function clearPromptCaptures() {
+  const button = byId("prompt-capture-clear");
+  button.disabled = true;
+  try {
+    const result = await bridge.apiPost("prompt-capture-control", {
+      action: "clear",
+    });
+    if (!result.ok) throw new Error(result.error || "操作失败");
     await refreshPromptCaptureStatus();
-    return;
+  } catch (error) {
+    button.disabled = false;
+    throw error;
   }
-  renderPromptCapture(result.capture);
+}
+
+function appendPromptCaptureViewer(container, event) {
+  const data = event.details || {};
+  const requestId = event.kind === "usage"
+    ? data.llm_request_id
+    : ["request", "mutation"].includes(event.kind)
+      ? event.request_id
+      : "";
+  if (!["request", "mutation", "usage"].includes(event.kind)) return;
+
+  const section = document.createElement("section");
+  section.className = "prompt-capture-inline";
+  const heading = document.createElement("h4");
+  heading.textContent = "提示词原文改动";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "inline-button";
+  button.textContent = requestId ? "读取本次请求原文" : "本次请求未关联 request ID";
+  button.disabled = !requestId;
+  const content = document.createElement("div");
+  content.className = "prompt-capture-inline-content";
+  content.hidden = true;
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    button.textContent = "读取中…";
+    try {
+      const result = await bridge.apiGet("prompt-capture-detail", {
+        request_id: requestId,
+      });
+      content.replaceChildren();
+      const captures = result.captures || (result.capture ? [result.capture] : []);
+      if (captures.length) {
+        for (const capture of captures) {
+          content.append(renderPromptCapture(capture));
+        }
+      } else {
+        const empty = document.createElement("p");
+        empty.className = "prompt-capture-meta";
+        const changedValue =
+          data.hook_changed || data.request_hook_changed || data.changed || [];
+        const changed = Array.isArray(changedValue)
+          ? changedValue
+          : [changedValue];
+        empty.textContent = changed.some((field) =>
+          ["system", "prompt"].includes(field)
+        )
+          ? "本条记录观察到提示词字段变化，但原文详情已过期、达到保留上限或未能完成采集。"
+          : "本次请求没有观察到 system prompt / prompt 改动，因此没有保存原文。";
+        content.append(empty);
+      }
+      content.hidden = false;
+      button.textContent = "重新读取本次请求原文";
+    } catch (error) {
+      content.replaceChildren();
+      const failure = document.createElement("p");
+      failure.className = "prompt-capture-truncated";
+      failure.textContent = `原文读取失败：${error.message || "请重试"}`;
+      content.append(failure);
+      content.hidden = false;
+      button.textContent = "重试读取原文";
+    } finally {
+      button.disabled = false;
+    }
+  });
+  section.append(heading, button, content);
+  container.append(section);
 }
 
 function mutationDeltaSummary(delta = {}) {
@@ -463,6 +514,7 @@ function eventDetails(event) {
     }
     wrapper.append(title, list);
   }
+  appendPromptCaptureViewer(wrapper, event);
   return wrapper;
 }
 
@@ -1015,29 +1067,9 @@ async function exportCsv() {
 await bridge.ready();
 byId("refresh").addEventListener("click", load);
 byId("export").addEventListener("click", exportCsv);
-byId("prompt-capture-arm").addEventListener("click", async () => {
-  try {
-    if (promptCaptureArmed) {
-      await controlPromptCapture("disarm");
-      return;
-    }
-    await controlPromptCapture("arm");
-  } catch (error) {
-    byId("prompt-capture-status").textContent =
-      `采集控制失败：${error.message || "请重试"}`;
-  }
-});
-byId("prompt-capture-view").addEventListener("click", async () => {
-  try {
-    await viewPromptCapture();
-  } catch (error) {
-    byId("prompt-capture-status").textContent =
-      `原文读取失败：${error.message || "请重试"}`;
-  }
-});
 byId("prompt-capture-clear").addEventListener("click", async () => {
   try {
-    await controlPromptCapture("clear");
+    await clearPromptCaptures();
   } catch (error) {
     byId("prompt-capture-status").textContent =
       `原文清除失败：${error.message || "请重试"}`;

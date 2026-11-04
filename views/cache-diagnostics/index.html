@@ -259,30 +259,21 @@
       <section class="panel prompt-capture-panel">
         <div class="panel-heading">
           <div>
-            <h2>一次性提示词原文诊断</h2>
+            <h2>自动提示词改动记录</h2>
             <p>
-              可查看各请求钩子修改前后，以及钩子链结束时的 system prompt / prompt。
+              展开时间线中的请求详情，可直接查看具体插件修改前后和最终提示词。
             </p>
           </div>
-          <span id="prompt-capture-status" class="updated">原文采集默认关闭</span>
+          <span id="prompt-capture-status" class="updated">正在读取记录状态…</span>
         </div>
         <div class="prompt-capture-warning">
-          <strong>采集范围：</strong>
-          点击后采集下一次请求，最多等待 10 分钟；展示每个改动处理器的前后原文及钩子链结束值。原文保存在插件本地独立数据库，24 小时后自动删除，也可立即清除；不进入普通日志或 CSV。
-          只覆盖 system prompt / prompt，不含上下文、工具参数或中转商最终 HTTP 请求。
+          只要 AstrBot 的请求钩子实际修改 <code>system_prompt</code> 或 <code>prompt</code>，插件就自动保存初始值、逐处理器修改前后值和钩子链最终值；仅保留最近 100 条且最多 24 小时，详情按需展开读取，不进入普通日志或 CSV。范围是钩子阶段，不代表 Provider 最终发送给中转商的 HTTP 请求。
         </div>
         <div class="prompt-capture-controls">
-          <button id="prompt-capture-arm" class="refresh-button" type="button">
-            采集下一次请求
-          </button>
-          <button id="prompt-capture-view" class="refresh-button" type="button" hidden>
-            查看捕获原文
-          </button>
           <button id="prompt-capture-clear" class="refresh-button" type="button" hidden>
-            清除原文
+            清除全部原文记录
           </button>
         </div>
-        <div id="prompt-capture-content" class="prompt-capture-content" hidden></div>
       </section>
 
       <div id="group-modal" class="modal" hidden>
