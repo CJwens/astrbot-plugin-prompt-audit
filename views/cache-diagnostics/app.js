@@ -18,6 +18,7 @@ let selectedGroupHash = "";
 let currentGroupDetail = null;
 let loadInProgress = false;
 let reloadRequested = false;
+let requestModalReturnFocus = null;
 
 function formatTime(value) {
   const date = new Date(value);
@@ -621,7 +622,7 @@ function renderEvents(events) {
     const expand = document.createElement("button");
     expand.type = "button";
     expand.className = "inline-button";
-    expand.textContent = "展开详情";
+    expand.textContent = "查看详情";
     detailCell.append(detailText, expand);
     const sessionCell = document.createElement("td");
     sessionCell.className = "hash-cell";
@@ -630,19 +631,10 @@ function renderEvents(events) {
       event.session_hash
     );
     row.append(detailCell, sessionCell);
-    const expandedRow = document.createElement("tr");
-    expandedRow.className = "expanded-row";
-    expandedRow.hidden = true;
-    const expandedCell = document.createElement("td");
-    expandedCell.colSpan = 4;
-    expandedCell.append(eventDetails(event));
-    expandedRow.append(expandedCell);
     expand.addEventListener("click", () => {
-      expandedRow.hidden = !expandedRow.hidden;
-      expand.textContent = expandedRow.hidden ? "展开详情" : "收起详情";
+      openRequestModal(event, expand);
     });
     body.append(row);
-    body.append(expandedRow);
   }
 }
 
@@ -946,10 +938,38 @@ function renderGroupDetail(detail) {
 function openGroupModal() {
   if (!currentGroupDetail) return;
   byId("group-modal").hidden = false;
+  byId("close-group-modal").focus();
 }
 
 function closeGroupModal() {
   byId("group-modal").hidden = true;
+}
+
+function hasOpenModal() {
+  return Boolean(document.querySelector(".modal:not([hidden])"));
+}
+
+function openRequestModal(event, trigger) {
+  const presentation = eventPresentation(event);
+  const data = event.details || {};
+  byId("request-modal-title").textContent = presentation.label;
+  byId("request-modal-subtitle").textContent = [
+    formatTime(event.created_at),
+    data.provider_id,
+    data.model,
+    displayIdentity(data.group_name || data.user_name, event.session_hash),
+  ].filter(Boolean).join(" · ");
+  const body = byId("request-modal-body");
+  body.replaceChildren(eventDetails(event));
+  requestModalReturnFocus = trigger;
+  byId("request-modal").hidden = false;
+  byId("close-request-modal").focus();
+}
+
+function closeRequestModal() {
+  byId("request-modal").hidden = true;
+  if (requestModalReturnFocus?.isConnected) requestModalReturnFocus.focus();
+  requestModalReturnFocus = null;
 }
 
 function setScopeMode(mode) {
@@ -970,7 +990,8 @@ function setScopeMode(mode) {
   load();
 }
 
-async function load() {
+async function load({ automatic = false } = {}) {
+  if (automatic && hasOpenModal()) return;
   if (loadInProgress) {
     reloadRequested = true;
     return;
@@ -997,6 +1018,7 @@ async function load() {
       scope_page: currentScopePage,
       scope_page_size: scopePageSize,
     });
+    if (automatic && hasOpenModal()) return;
     renderSummary(result.summary);
     renderScopeNavigation(result.scope_navigation);
     renderGroupDetail(result.group_detail);
@@ -1026,7 +1048,7 @@ async function load() {
     loadInProgress = false;
     if (reloadRequested) {
       reloadRequested = false;
-      load();
+      if (!hasOpenModal()) load();
     }
   }
 }
@@ -1051,7 +1073,7 @@ async function exportCsv() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `prompt-audit-${hours}h-${exportTimestamp()}.csv`;
+    link.download = `prompt-audit-full-${hours}h-${exportTimestamp()}.csv`;
     link.click();
     URL.revokeObjectURL(url);
     byId("notice").textContent =
@@ -1064,9 +1086,73 @@ async function exportCsv() {
   }
 }
 
+async function exportHumanCsv() {
+  const hours = Number(byId("range").value);
+  const button = byId("human-export");
+  button.disabled = true;
+  byId("notice").textContent = "正在整理易读 CSV…";
+  byId("notice").className = "notice";
+  try {
+    const result = await bridge.apiGet("human-export", { hours });
+    const lines = [
+      result.columns.map(csvCell).join(","),
+      ...result.rows.map((row) =>
+        result.columns.map((column) => csvCell(row[column])).join(",")
+      ),
+    ];
+    const blob = new Blob([`\ufeff${lines.join("\r\n")}`], {
+      type: "text/csv;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `prompt-audit-readable-${hours}h-${exportTimestamp()}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+    byId("notice").textContent =
+      `已导出 ${numberFormat.format(result.rows.length)} 行易读记录。缓存数据为服务商响应报告值；上下文和提示词原文不在文件中。`;
+  } catch (error) {
+    byId("notice").textContent =
+      `易读 CSV 导出失败：${error.message || "请稍后重试"}`;
+    byId("notice").className = "notice error";
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function exportAnalysisJson() {
+  const hours = Number(byId("range").value);
+  const button = byId("analysis-export");
+  button.disabled = true;
+  byId("notice").textContent = "正在整理请求级分析数据…";
+  byId("notice").className = "notice";
+  try {
+    const result = await bridge.apiGet("analysis-export", { hours });
+    const blob = new Blob([`${JSON.stringify(result, null, 2)}\n`], {
+      type: "application/json;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `prompt-audit-analysis-${hours}h-${exportTimestamp()}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    byId("notice").textContent =
+      `已导出 ${numberFormat.format(result.requests?.length || 0)} 条请求级分析记录；不含提示词、上下文原文或工具参数。`;
+  } catch (error) {
+    byId("notice").textContent =
+      `分析包导出失败：${error.message || "请稍后重试"}`;
+    byId("notice").className = "notice error";
+  } finally {
+    button.disabled = false;
+  }
+}
+
 await bridge.ready();
-byId("refresh").addEventListener("click", load);
+byId("refresh").addEventListener("click", () => load());
 byId("export").addEventListener("click", exportCsv);
+byId("human-export").addEventListener("click", exportHumanCsv);
+byId("analysis-export").addEventListener("click", exportAnalysisJson);
 byId("prompt-capture-clear").addEventListener("click", async () => {
   try {
     await clearPromptCaptures();
@@ -1094,8 +1180,13 @@ byId("scope-tab-private").addEventListener("click", () =>
 byId("group-detail-button").addEventListener("click", openGroupModal);
 byId("close-group-modal").addEventListener("click", closeGroupModal);
 document.querySelector("[data-close-modal]").addEventListener("click", closeGroupModal);
+byId("close-request-modal").addEventListener("click", closeRequestModal);
+document.querySelector("[data-close-request-modal]").addEventListener("click", closeRequestModal);
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closeGroupModal();
+  if (event.key === "Escape") {
+    closeRequestModal();
+    closeGroupModal();
+  }
 });
 byId("previous-page").addEventListener("click", () => {
   if (currentPage > 1) {
@@ -1129,5 +1220,5 @@ bridge.onContext(() => {
 load();
 refreshPromptCaptureStatus();
 window.setInterval(() => {
-  if (document.visibilityState === "visible") load();
+  if (document.visibilityState === "visible") load({ automatic: true });
 }, 30_000);

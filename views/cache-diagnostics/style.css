@@ -94,6 +94,7 @@ h1 {
 
 .actions {
   gap: 10px;
+  flex-wrap: wrap;
 }
 
 .range-control {
@@ -412,11 +413,6 @@ tbody tr:last-child td {
 
 .inline-button:hover {
   border-color: var(--accent);
-}
-
-.expanded-row td {
-  padding: 0;
-  background: color-mix(in srgb, var(--bg) 44%, var(--panel));
 }
 
 .event-expanded {
@@ -798,6 +794,10 @@ footer {
   padding: 18px 22px 24px;
 }
 
+#request-modal .event-expanded {
+  padding: 0;
+}
+
 .modal-body > section {
   margin-top: 20px;
 }
@@ -881,6 +881,7 @@ footer {
 
   .actions {
     width: 100%;
+    gap: 8px;
   }
 
   .range-control {

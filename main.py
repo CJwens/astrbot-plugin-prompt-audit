@@ -19,6 +19,7 @@ from astrbot.api.provider import LLMResponse, Provider, ProviderRequest
 from astrbot.api.web import json_response, request
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
+from .analysis_export import build_analysis_export, build_human_csv_export
 from .request_association import RequestAssociationRegistry
 from .request_export import request_export_fields
 from .prompt_capture import PromptCaptureBuffer, capture_prompt_request
@@ -31,7 +32,7 @@ from .request_mutation import (
 from .routing_identity import build_routing_metadata
 
 PLUGIN_NAME = "astrbot_plugin_prompt_audit"
-PLUGIN_VERSION = "0.17.1"
+PLUGIN_VERSION = "0.17.4"
 MAX_SESSIONS = 512
 MAX_EVENTS = 10000
 MAX_HANDLER_DETAILS = 500
@@ -175,6 +176,18 @@ class PromptAuditPlugin(star.Star):
             self.export_data,
             ["GET"],
             "Export bounded cache and prompt diagnostics without prompt contents.",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/analysis-export",
+            self.analysis_export,
+            ["GET"],
+            "Export compact request-level cache diagnostics as JSON.",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/human-export",
+            self.human_export,
+            ["GET"],
+            "Export readable request-level cache diagnostics as CSV.",
         )
         context.register_web_api(
             f"/{PLUGIN_NAME}/prompt-capture-status",
@@ -1742,6 +1755,84 @@ class PromptAuditPlugin(star.Star):
                 "rows": exported_rows,
                 "limited_to": MAX_EVENTS,
             }
+        )
+
+    async def analysis_export(self):
+        hours = request.query.get("hours", 24, type=int)
+        hours = min(max(hours or 24, 1), RETENTION_DAYS * 24)
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat(timespec="seconds")
+        with sqlite3.connect(self._database, timeout=5) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                """
+                SELECT created_at, kind, request_id, session_hash, details
+                FROM diagnostic_events
+                WHERE created_at >= ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (cutoff, MAX_EVENTS),
+            ).fetchall()
+        events = [
+            {
+                "created_at": row["created_at"],
+                "kind": row["kind"],
+                "request_id": row["request_id"],
+                "session_hash": row["session_hash"],
+                "details": json.loads(row["details"]),
+            }
+            for row in rows
+        ]
+        return json_response(
+            build_analysis_export(
+                events,
+                hours=hours,
+                generated_at=datetime.now(timezone.utc).isoformat(
+                    timespec="seconds"
+                ),
+                limited_to=MAX_EVENTS,
+            )
+        )
+
+    async def human_export(self):
+        hours = request.query.get("hours", 24, type=int)
+        hours = min(max(hours or 24, 1), RETENTION_DAYS * 24)
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat(timespec="seconds")
+        with sqlite3.connect(self._database, timeout=5) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                """
+                SELECT created_at, kind, request_id, session_hash, details
+                FROM diagnostic_events
+                WHERE created_at >= ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (cutoff, MAX_EVENTS),
+            ).fetchall()
+        events = [
+            {
+                "created_at": row["created_at"],
+                "kind": row["kind"],
+                "request_id": row["request_id"],
+                "session_hash": row["session_hash"],
+                "details": json.loads(row["details"]),
+            }
+            for row in rows
+        ]
+        return json_response(
+            build_human_csv_export(
+                events,
+                hours=hours,
+                generated_at=datetime.now(timezone.utc).isoformat(
+                    timespec="seconds"
+                ),
+                limited_to=MAX_EVENTS,
+            )
         )
 
     @filter.on_astrbot_loaded()

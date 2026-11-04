@@ -28,8 +28,14 @@
           <button id="refresh" class="refresh-button" type="button">
             <span aria-hidden="true">↻</span> 刷新
           </button>
+          <button id="human-export" class="refresh-button" type="button">
+            易读 CSV
+          </button>
           <button id="export" class="refresh-button" type="button">
-            导出 CSV
+            完整 CSV
+          </button>
+          <button id="analysis-export" class="refresh-button" type="button">
+            导出分析 JSON
           </button>
         </div>
       </header>
@@ -261,13 +267,13 @@
           <div>
             <h2>自动提示词改动记录</h2>
             <p>
-              展开时间线中的请求详情，可直接查看具体插件修改前后和最终提示词。
+              打开时间线中的请求详情，可查看具体插件修改前后和最终提示词。
             </p>
           </div>
           <span id="prompt-capture-status" class="updated">正在读取记录状态…</span>
         </div>
         <div class="prompt-capture-warning">
-          只要 AstrBot 的请求钩子实际修改 <code>system_prompt</code> 或 <code>prompt</code>，插件就自动保存初始值、逐处理器修改前后值和钩子链最终值；仅保留最近 100 条且最多 24 小时，详情按需展开读取，不进入普通日志或 CSV。范围是钩子阶段，不代表 Provider 最终发送给中转商的 HTTP 请求。
+          只要 AstrBot 的请求钩子实际修改 <code>system_prompt</code> 或 <code>prompt</code>，插件就自动保存初始值、逐处理器修改前后值和钩子链最终值；仅保留最近 100 条且最多 24 小时，详情按需读取，不进入普通日志或导出文件。范围是钩子阶段，不代表 Provider 最终发送给中转商的 HTTP 请求。
         </div>
         <div class="prompt-capture-controls">
           <button id="prompt-capture-clear" class="refresh-button" type="button" hidden>
@@ -288,6 +294,21 @@
             <button id="close-group-modal" class="modal-close" type="button" aria-label="关闭">×</button>
           </header>
           <div id="group-modal-body" class="modal-body"></div>
+        </section>
+      </div>
+
+      <div id="request-modal" class="modal" hidden>
+        <div class="modal-backdrop" data-close-request-modal></div>
+        <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="request-modal-title">
+          <header class="modal-heading">
+            <div>
+              <div class="eyebrow">REQUEST DETAIL</div>
+              <h2 id="request-modal-title">请求详情</h2>
+              <p id="request-modal-subtitle" class="modal-subtitle"></p>
+            </div>
+            <button id="close-request-modal" class="modal-close" type="button" aria-label="关闭">×</button>
+          </header>
+          <div id="request-modal-body" class="modal-body"></div>
         </section>
       </div>
 
